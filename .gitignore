@@ -1,0 +1,13 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 库存数据本身不入库：改存量是高频操作，每次都产生一条 diff 提交是噪声。
+# 回滚靠写入时自动生成的 .bak。
+/inventory.json
+/inventory.json.bak
+
+# 编辑器/系统
+.vscode/
+Thumbs.db
+desktop.ini

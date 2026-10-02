@@ -1,0 +1,9 @@
+# 换行符统一为 LF，优先级高于本机的 core.autocrlf。
+# 这个文件让仓库在任何平台上检出都得到同一份字节，
+# 避免「每次在不同机器上编辑都产生整文件 diff」。
+* text=auto eol=lf
+
+# 二进制文件不要做行尾转换和字符集探测。
+*.woff2 -text
+*.zip   -text
+*.vsix  -text
