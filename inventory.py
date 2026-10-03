@@ -1665,10 +1665,14 @@ class SearchHit:
     per_token: list  # [(分数, 原因, 词), ...]
 
 
-def search_components(components, tokens, any_mode=False, limit=None):
+def search_components(components, tokens, any_mode=False):
     """AND 检索：元件必须为每个查询词都提供至少一个命中。
 
     any_mode 打开时改为 OR，并按命中词数归一化分数。
+
+    这里刻意不接 limit：截断是显示层的事。返回值必须是「命中了什么」，调用方
+    才能拿它判定成败、数总数、定退出码——一个返回值不能同时既表示命中、又表示
+    打算显示多少。`-n` 的规则整个归 apply_limit 管。
     """
     if not tokens:
         return []
@@ -1699,8 +1703,6 @@ def search_components(components, tokens, any_mode=False, limit=None):
         results.append(SearchHit(comp, total, per))
 
     results.sort(key=lambda h: (-h.score, h.component.seq))
-    if limit is not None:
-        results = results[:limit]
     return results
 
 
@@ -2248,7 +2250,49 @@ def attach_notes(lines, components, indent="  "):
     return out
 
 
-def render_hits(hits, tokens, show_reason=True):
+# 「-n 切掉了一部分」这句说明怎么写。只在这里出现一次：命令行与交互模式共用它，
+# 同一件事不允许有两种说法。键是 (命令, 是否 --low)。
+#
+# list 的两种情形必须分开：--low 下说「库里实际 N 条」是错的，库里不止那么多条，
+# 是存量偏低的才有 N 条；而「看全部」也不能写成 `list -n N`，那会把人引向全集。
+#
+# 三句措辞都刻意不含「共」字：render_hits / render_components 末尾那行「共 N 条」
+# 数的是收到了多少条（显示数），这里说的是实际有多少条（事实数）。同一个字混用
+# 就会看混——当初把 limit 传进查询层，正是「实际 200 条却说共 20 条」的由来。
+_PAGE_WORDS = {
+    ("search", False): ("实际匹配", "search ..."),
+    ("list", False): ("库里实际", "list"),
+    ("list", True): ("存量偏低的有", "list --low"),
+}
+
+
+def apply_limit(items, limit, command, low=False):
+    """`-n` 的全部规则：切页、报总数、说明切了什么。
+
+    返回 (要显示的那一页, 切片前的总数, 说明行或 None)。总数跟着切片一起返回，
+    是为了让安全写法成为最省事的写法：只要调用方各自 len() 一次，迟早有人拿截断
+    后的长度当事实报出去——JSON 的 count 与说明行里的条数都正是这么踩的坑。
+
+    limit 为 None 表示不限（命令行不给 -n 就是全列）。limit <= 0 一律拒绝：Python
+    切片在 0 与负数上语义会翻——[:0] 是空、[:-1] 丢掉排序最低的那条——两者都不是
+    「最多显示 N 条」，而空切片还会让 cmd_search 把「有匹配却一条没显示」误判成
+    「未找到」（退出码 3，正是 README 教你用来判断库里有没有的那个码）。
+
+    校验放在这里而不是 argparse 的 type=，因为交互模式不走 argparse：写进 type=
+    这条规则就又变成两份，那正是要消灭的东西。
+    """
+    if limit is not None and limit <= 0:
+        raise AppError(f"-n 应该是正整数，实际是 {limit}", EXIT_USAGE)
+    if limit is None or limit >= len(items):
+        return items, len(items), None
+    what, how = _PAGE_WORDS[(command, bool(low))]
+    return items[:limit], len(items), (
+        f"（{what} {len(items)} 条，这里只列前 {limit} 条；"
+        f"用 {how} -n {len(items)} 看全部）"
+    )
+
+
+def render_hits(hits, show_reason=True):
     if not hits:
         print("没有匹配的元件。")
         print("提示：用 -A/--any 放宽为「任一命中」；或检查标签的写法。")
@@ -2269,7 +2313,7 @@ def render_hits(hits, tokens, show_reason=True):
     print(f"\n共 {len(hits)} 条")
 
 
-def render_components(components, title=None):
+def render_components(components):
     if not components:
         print("库存为空。")
         return
@@ -2396,7 +2440,7 @@ def build_parser():
     ps = sub.add_parser("search", parents=[sub_common], help="检索元件")
     ps.add_argument("query", nargs="+", help="查询词，多个词之间是「全部命中」")
     ps.add_argument("-A", "--any", action="store_true", help="放宽为「任一命中」")
-    ps.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条")
+    ps.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条（须为正整数）")
     ps.add_argument("--json", action="store_true", help="输出 JSON")
 
     pa = sub.add_parser("add", parents=[sub_common], help="添加元件")
@@ -2419,7 +2463,7 @@ def build_parser():
     _add_stock_options(pst)
 
     pl = sub.add_parser("list", parents=[sub_common], help="列出全部元件")
-    pl.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条")
+    pl.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条（须为正整数）")
     pl.add_argument("--low", action="store_true", help="只列出存量偏低的")
     pl.add_argument("--json", action="store_true", help="输出 JSON")
 
@@ -2591,17 +2635,22 @@ def cmd_search(args, path):
     if not tokens:
         raise AppError("查询为空", EXIT_USAGE)
 
-    hits = search_components(inv.components, tokens, any_mode=args.any, limit=args.limit)
+    hits = search_components(inv.components, tokens, any_mode=args.any)
+    # 退出码与 total 都看 hits，只有渲染看 page：`-n` 切的是显示，不是事实。
+    page, total, note = apply_limit(hits, args.limit, "search")
 
     if args.json:
         payload = {
-            "count": len(hits),
+            "count": len(page),
+            "total": total,
             "query": tokens,
-            "results": [component_to_json(h.component, h.score, h.per_token) for h in hits],
+            "results": [component_to_json(h.component, h.score, h.per_token) for h in page],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        render_hits(hits, tokens)
+        render_hits(page)
+        if note:
+            print(note)
     return EXIT_OK if hits else EXIT_NOTFOUND
 
 
@@ -2746,14 +2795,16 @@ def cmd_list(args, path):
     comps = sorted(inv.components, key=lambda c: c.seq)
     if args.low:
         comps = [c for c in comps if c.stock.is_low()]
-    if args.limit is not None:
-        comps = comps[: args.limit]
+    page, total, note = apply_limit(comps, args.limit, "list", args.low)
 
     if args.json:
-        payload = {"count": len(comps), "results": [component_to_json(c) for c in comps]}
+        payload = {"count": len(page), "total": total,
+                   "results": [component_to_json(c) for c in page]}
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        render_components(comps)
+        render_components(page)
+        if note:
+            print(note)
     return EXIT_OK
 
 
@@ -2822,6 +2873,16 @@ def run_selftest():
     def dim(token, hint=None):
         q = parse_quantity(token, hint=hint)
         return None if q is None else q.dim
+
+    def _raises(fn, label):
+        """断言 fn 抛 AppError，返回那条错误好顺带查退出码。"""
+        checks[0] += 1
+        try:
+            fn()
+        except AppError as e:
+            return e
+        failures.append(f"{label}：应当报错，实际通过了")
+        return None
 
     # --- 别名表健康度 ---
     ok(not _ALIAS_CONFLICTS, f"类型别名表存在冲突：{_ALIAS_CONFLICTS}")
@@ -2940,6 +3001,40 @@ def run_selftest():
     eq(len(hits), 1, "AND 检索：电容 + 100nF 应命中 1 条")
     hits = search_components([comp], ["电容", "51R"])
     eq(len(hits), 0, "AND 检索：电容 + 51R 应命中 0 条")
+
+    # --- -n：只切显示，不改事实 ---
+    #
+    # 这组钉的是「切页、报总数、说明切了什么」那一条规则。四个调用点（命令行的
+    # search 与 list、交互模式的 do_search 与 do_list）共用 apply_limit，所以这里
+    # 测的就是那四条路径共同的行为。
+    _L = [1, 2, 3, 4, 5]
+    eq(apply_limit(_L, None, "search"), (_L, 5, None), "不给 -n 就全列，也不多说一句")
+    eq(apply_limit(_L, 5, "search"), (_L, 5, None), "-n 恰好等于总数时不算截断")
+    eq(apply_limit(_L, 9, "search"), (_L, 5, None), "-n 给多了就全给")
+    eq(apply_limit([], 5, "search"), ([], 0, None), "空列表也不多说一句")
+    eq(apply_limit(_L, 2, "search"),
+       ([1, 2], 5, "（实际匹配 5 条，这里只列前 2 条；用 search ... -n 5 看全部）"),
+       "截断后那行说明的措辞")
+    eq(apply_limit(_L, 2, "list"),
+       ([1, 2], 5, "（库里实际 5 条，这里只列前 2 条；用 list -n 5 看全部）"),
+       "list 的说明用「库里实际」")
+    eq(apply_limit(_L, 2, "list", True),
+       ([1, 2], 5, "（存量偏低的有 5 条，这里只列前 2 条；用 list --low -n 5 看全部）"),
+       "list --low 既不能说库里有这么多条，看全部也得带上 --low")
+    ok("共" not in apply_limit(_L, 2, "search")[2],
+       "说明行不得占用「共」字，那是 renderer 上面那行显示的条数")
+
+    _e0 = _raises(lambda: apply_limit(_L, 0, "search"), "-n 0 应当报错")
+    eq(_e0.code, EXIT_USAGE, "-n 0 是用法错误，不是「未找到」——它曾把 exit 3 变成假否定")
+    eq(str(_e0), "-n 应该是正整数，实际是 0", "-n 的措辞只有一份")
+    _e1 = _raises(lambda: apply_limit(_L, -1, "search"), "-n -1 应当报错")
+    eq(_e1.code, EXIT_USAGE, "负索引不得泄漏到表面：-1 曾静默丢掉最后一条匹配")
+    _raises(lambda: apply_limit([], 0, "search"), "空列表配 -n 0 也该报错：校验先于数据")
+
+    _seven = [Component(id=f"{i:08d}-1111-2222-3333-444444444444", seq=i,
+                        tags=["C", "0805", "1uF"], stock=Stock("coarse", level=0))
+              for i in range(1, 8)]
+    eq(len(search_components(_seven, ["C"])), 7, "查询层不再截断：它返回全部命中")
 
     # --- 存量模型 ---
     eq(Stock.from_dict({"mode": "coarse", "level": 3}).label(), "多(3)", "粗略存量显示")
@@ -3549,16 +3644,6 @@ def run_selftest():
     #
     # 值位置与标签位置是两套写法，这里把差别钉死：档位词与 levelN/qtyN 两边共用，
     # 裸数字与增减词只在值位置认。改动任何一边都要过这组断言。
-
-    def _raises(fn, label):
-        """断言 fn 抛 AppError，返回那条错误好顺带查退出码。"""
-        checks[0] += 1
-        try:
-            fn()
-        except AppError as e:
-            return e
-        failures.append(f"{label}：应当报错，实际通过了")
-        return None
 
     # 词表整张都认——「档位词表就不能全收吗」这句就是这条断言。
     for _w, _lv in STOCK_WORDS.items():

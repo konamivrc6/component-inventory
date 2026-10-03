@@ -37,6 +37,7 @@ from inventory import (
     PACKAGE_QUESTION,
     STOCK_PROMPT,
     STOCK_QUESTION,
+    apply_limit,
     classify_tags,
     cmd_add,
     cmd_remove,
@@ -103,7 +104,7 @@ HELP_TEXT = """\
   --note 文本     备注（只有 add 有；会显示在 list 与 search 里）
   --force         与库中元件重复或包含时仍然添加，不追问（只有 add 有）
   -A, --any       检索时放宽为「任一命中」，默认是全部命中
-  -n N            最多显示 N 条（默认 20）
+  -n N            最多显示 N 条（默认 20；须为正整数）
 
 目标怎么写
   #7              永久编号为 7 的元件。编号只增不减，删除后不回收
@@ -261,26 +262,20 @@ def do_search(rest, path):
     opts, words = scan_options(rest, SEARCH_SPEC)
     if not words:
         raise AppError("查询为空。用法：search 查询词...", EXIT_USAGE)
-    limit = opts.get("limit", PAGE)
-    if limit <= 0:
-        raise AppError(f"-n 应该是正整数，实际是 {limit}", EXIT_USAGE)
 
     inv = get_inv(path)
-    # 先拿全集再自己切片。若把 limit 直接传给 search_components，它会在返回前切掉，
-    # 而 render_hits 打印的「共 N 条」数的是它收到的长度——那会变成
-    # 「实际匹配 200 条，却告诉你共 20 条」，是主动误导。
     hits = search_components(inv.components, words, any_mode=opts.get("any", False))
+    # apply_limit 排在空结果分支之前：`-n 0` 是用法错误，不该被「反正没东西可显示」
+    # 提前吞掉，否则这一条与命令行那边的校验时机就不一致了。
+    page, _total, note = apply_limit(hits, opts.get("limit", PAGE), "search")
     if not hits:
         print("没有匹配的元件。")
         print("提示：加 -A 放宽为「任一命中」；用 list 看全部；用 #序号 直接定位。")
         return EXIT_NOTFOUND
 
-    render_hits(hits[:limit], words)
-    if len(hits) > limit:
-        # 措辞上刻意避开「共」字：render_hits 上面那行「共 N 条」数的是它显示了多少条，
-        # 这里要说的是实际匹配了多少条。两个数字含义不同，用同一个字会看混。
-        print(f"（实际匹配 {len(hits)} 条，这里只列前 {limit} 条；"
-              f"用 search ... -n {len(hits)} 看全部）")
+    render_hits(page)
+    if note:
+        print(note)
     return EXIT_OK
 
 
@@ -450,23 +445,21 @@ def do_stock(rest, path):
 
 def do_list(rest, path):
     opts, _ = scan_options(rest, LIST_SPEC)
-    limit = opts.get("limit", PAGE)
-    if limit <= 0:
-        raise AppError(f"-n 应该是正整数，实际是 {limit}", EXIT_USAGE)
-
     inv = get_inv(path)
     comps = sorted(inv.components, key=lambda c: c.seq)
     if opts.get("low"):
         comps = [c for c in comps if c.stock.is_low()]
+    # 和 do_search 一样，校验排在空结果的提前返回之前。
+    page, _total, note = apply_limit(comps, opts.get("limit", PAGE), "list",
+                                     bool(opts.get("low")))
 
     if not comps:
         print("没有存量偏低的元件。" if opts.get("low") else "库存为空。")
         return EXIT_OK
 
-    total = len(comps)
-    render_components(comps[:limit])
-    if total > limit:
-        print(f"（库里实际 {total} 条，这里只列前 {limit} 条；用 list -n {total} 看全部）")
+    render_components(page)
+    if note:
+        print(note)
     return EXIT_OK
 
 
@@ -583,10 +576,7 @@ def advise(code, path):
 
     同一个常量在命令行里是给 shell 判断用的，在这里变成「该提示用户什么」的分派依据。
     """
-    if code == EXIT_NOTFOUND:
-        # 不再提 -A：那是 search 的开关，而 NOTFOUND 现在只可能来自「编号不存在」。
-        print("提示：编号用 list 看全部；按标签找元件用 search，它会给出每条的编号。")
-    elif code == EXIT_USAGE:
+    if code == EXIT_USAGE:
         print("提示：输入 help 查看命令用法。")
     elif code == EXIT_DATA:
         print(f"提示：数据文件格式有问题（{path}）；上一版在 {Path(path).name}.bak。")
