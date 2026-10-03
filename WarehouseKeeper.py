@@ -42,10 +42,10 @@ from inventory import (
     cmd_add,
     cmd_show,
     default_data_path,
-    display_width,
     extract_stock_tags,
+    format_slot_table,
+    format_tag_line,
     load_inventory,
-    pad,
     render_components,
     render_hits,
     resolve_target,
@@ -248,16 +248,16 @@ def render_candidates(comps):
 
     自己写而不用 render_components，是因为后者会把「共 N 条」打成它收到的列表长度，
     而这里要显示的是「匹配到 M 个，只展示前 20 个」——两个数不一样。
+
+    缩进两格、列间一个空格：它整块挂在「匹配到 M 个元件：」下面，和上面刚打完的
+    那行命令属于同一段，缩进比命令行版本（列间两空格）紧一档。
     """
     rows = [
-        (f"[{i}]", f"#{c.seq}", " ".join(c.tags), f"存量: {c.stock.label()}")
+        ((f"[{i}]", f"#{c.seq}"), tuple(c.tags), (f"存量: {c.stock.label()}",))
         for i, c in enumerate(comps, 1)
     ]
-    w0 = max(display_width(r[0]) for r in rows)
-    w1 = max(display_width(r[1]) for r in rows)
-    w2 = min(max(display_width(r[2]) for r in rows), 60)
-    for r in rows:
-        print(f"  {pad(r[0], w0)} {pad(r[1], w1)} {pad(r[2], w2)} {r[3]}".rstrip())
+    for line in format_slot_table(rows, indent="  ", gap=" "):
+        print(line)
 
 
 def pick_one(inv, words, verb):
@@ -504,7 +504,7 @@ def do_stock(rest, path):
         comp.stock = Stock("coarse", level=opts["level"])
     comp.updated_at = _now()
     save_inventory(inv)
-    print(f"#{comp.seq}  {' '.join(comp.tags)}   存量: {old} → {comp.stock.label()}")
+    print(f"#{comp.seq}  {format_tag_line(comp.tags)}   存量: {old} → {comp.stock.label()}")
     return EXIT_OK
 
 
@@ -552,7 +552,7 @@ def do_remove(rest, path):
     # 这一整块缩进：它是「确认删除？」这个问题的上下文，和那个输入点属于同一段。
     # 详情行在字符串里已经自带两格，加上追问的一级正好比它再深一级。
     sub_print("即将删除：")
-    sub_print(f"  #{comp.seq}  {' '.join(comp.tags)}   存量: {comp.stock.label()}")
+    sub_print(f"  #{comp.seq}  {format_tag_line(comp.tags)}   存量: {comp.stock.label()}")
     if comp.note:
         sub_print(f"  备注: {comp.note}")
     sub_print(f"（上一版数据在 {Path(path).name}.bak，可以从那里恢复这次删除）")
@@ -562,7 +562,7 @@ def do_remove(rest, path):
 
     inv.components.remove(comp)
     save_inventory(inv)
-    print(f"已删除 #{comp.seq}  {' '.join(comp.tags)}")
+    print(f"已删除 #{comp.seq}  {format_tag_line(comp.tags)}")
     return EXIT_OK
 
 

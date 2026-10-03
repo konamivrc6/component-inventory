@@ -999,6 +999,30 @@ def _plausible(value, code):
     return lo <= abs(value) <= hi
 
 
+# --- 显示槽位 -----------------------------------------------------------------
+#
+# 标签在显示时按语义分列，列序固定。槽位名同时是分类的产物（TagPlan.slot_of）
+# 与渲染层的列序——**两边共用这一份字面量**，不各写一套，否则迟早漂移成两种排法。
+#
+#   类型 → 主值 → 电气参数 → 介质 → 封装 → 其它
+#
+# `C` 和 `1uF` 是元件的身份，挨在一起；耐压、功率、容差是附加条件，跟在主值后面
+# （`C 1uF 16V MLCC 0805` 读起来是「一个 1 微法、耐压 16 伏的 0805 陶瓷电容」）；
+# 介质说明它是哪一类构造，封装收口；认不出语义的一律甩到最后——「共阴绿红」
+# 这种描述词插在中间会把前面几列的节奏打断，而它恰恰是最不影响识别的那部分。
+SLOT_ORDER = ("type", "main", "elec", "medium", "package", "other")
+
+# 归到「电气参数」而不是「主值」的物理维度。其余维度都算主值，**包括 dim 为
+# None 的裸前缀与中缀写法**（`1k` / `4k7` / `3p` / `22p`）——dim 是 None 不等于
+# 「不是数值」，它只是维度歧义被刻意留到有上下文时再消解（见 Quantity 的注释），
+# 而它在显示上就是元件的那个值本身，放主值列才对。
+_ELEC_DIMS = frozenset({"voltage", "power", "current"})
+
+# 容差 `1%` / `5%`。它不是一个物理量，parse_quantity 认不出（`%` 不在单位表里），
+# 所以槽位判定里得单独留一条，否则电阻的精度会被甩到「其它」列去。
+_TOLERANCE_RE = re.compile(r"^\d+(?:\.\d+)?%$")
+
+
 @dataclass
 class TagPlan:
     """标签分类的结果。
@@ -1017,6 +1041,7 @@ class TagPlan:
     added_type: str | None = None        # 需要补进 tags 的类型码
     added_medium: str | None = None      # 需要补进 tags 的介质词
     absorbed: tuple = ()                 # 被封装吸收掉的冗余标签，由 cmd_add 从 tags 里删掉
+    slot_of: tuple = ()                  # 与传入 tags **逐位对齐**，每项是 SLOT_ORDER 之一
 
     def has(self, kind):
         return any(k == kind for k, _ in self.issues)
@@ -1032,22 +1057,32 @@ def classify_tags(tags, extra_package=None):
     extra_package 是给交互模式用的：调用方已经就封装问过用户、拿到了明确答复，
     这个值绕过封装表——**用户说是什么就是什么**。命令行没有这条通道，只能靠
     查表，认不出就报错。
+
+    副产品 slot_of 与传入的 tags 逐位对齐，记录每个标签属于哪个**显示槽位**
+    （见 SLOT_ORDER）。渲染层分列、以及 canonical_tags 重排，都只认它，不另写
+    一套判定——判定顺序只此一份。
     """
     cands = []       # (类型码, 来源, 原始标签)
     packages = []
     media = []
     params = []
     ambiguous = []   # µ 前缀这类真实歧义
+    slots = []       # 与 tags 逐位对齐的槽位名，每轮循环恰记一笔
 
     for tag in tags:
         code = canon_type(tag)
         if code is not None:
             cands.append((code, "explicit", tag))
+            slots.append("type")
             continue
 
         pkg = canon_package(tag)
         if pkg is not None:
+            # 封装必须排在数值之前判。今天 parse_quantity 不传 hint，`2.54` 和
+            # `18650` 恰好解析不出来，撞不上；一旦将来给数值解析传元件级 hint，
+            # 这两个会变成电阻值，与封装双命中。顺序跟着判定的优先级走。
             packages.append(pkg)
+            slots.append("package")
             continue
 
         med = canon_medium(tag)
@@ -1061,20 +1096,29 @@ def classify_tags(tags, extra_package=None):
             # 靠的就是这一条。强度压在 medium 级，压不过型号表和单位，
             # 所以 `薄膜 100k` 会如实报出冲突而不是静默选一个。
             cands.append(("C", "medium", tag))
+            slots.append("medium")
             continue
 
         desc = DESCRIPTOR_TYPE.get(tag.casefold())
         if desc is not None:
             # 中文描述性词：`色环` / `轻触` / `红` 这些。与介质同为弱证据，
             # 理由见 DESCRIPTOR_TYPE 的定义处。
+            #
+            # 槽位算「类型」：`黄 led 直插` 里的 `黄` 和 `led` 说的是同一件事的
+            # 两个侧面（什么颜色、什么东西），分成两列反而读不成句。注意
+            # canon_type 不查这张表，所以这一支必须自己记槽位。
             cands.append((desc, "descriptor", tag))
             params.append(tag)
+            slots.append("type")
             continue
 
         pn = _partno_type(tag)
         if pn is not None:
+            # 型号进「主值」列：对 `D 1N4148 SOD-123` 来说 1N4148 就是它的身份，
+            # 和 `1uF` 之于电容没有区别。
             cands.append((pn, "partno", tag))
             params.append(tag)
+            slots.append("main")
             continue
 
         q = parse_quantity(tag)
@@ -1096,9 +1140,15 @@ def classify_tags(tags, extra_package=None):
                         # 用户写的是 u 还是 n。
                         ambiguous.append((letter, tag))
             params.append(tag)
+            # 耐压 / 功率 / 电流是附加条件，其余维度（含 dim 为 None 的裸前缀与
+            # 中缀）都是元件的主值。
+            slots.append("elec" if q.dim in _ELEC_DIMS else "main")
             continue
 
+        # 落不进任何一类的残差。容差是这里唯一还认得出来的语义（`1%` 不是物理量，
+        # parse_quantity 认不出），其余一律进「其它」列，排在最后。
         params.append(tag)
+        slots.append("elec" if _TOLERANCE_RE.match(normalize_text(tag)) else "other")
 
     # 封装是单值字段，而 `C 直插 5x11 100uF` 里两个标签都会命中封装。取最具体的
     # 那个——安装方式太泛，一旦同时有真正的封装就该让位。稳定排序，同级保持书写顺序。
@@ -1174,7 +1224,98 @@ def classify_tags(tags, extra_package=None):
         added_type=added_type,
         added_medium=added_medium,
         absorbed=absorbed,
+        slot_of=tuple(slots),
     )
+
+
+# 单位维度的规范符号。只用于「数字 + ASCII 单位简写」这一种形态的改写。
+_CANON_UNIT = {
+    "resistance": "Ω",
+    "capacitance": "F",
+    "inductance": "H",
+    "frequency": "Hz",
+    "voltage": "V",
+    "current": "A",
+    "power": "W",
+}
+
+
+@lru_cache(maxsize=None)
+def canon_unit(tag):
+    """把一个标签的**单位写法**规整到规范形式，认不出这种形态就原样返回。
+
+    只有「数字 + ASCII 单位简写」这一种形态需要规整，因为它是全项目唯一
+    「同一个量有好几种写法」的地方：`51r` / `51R` / `51Ω` 是一回事，
+    `0.25w` / `0.25W` 是一回事。别的标签没有可规整的余地——类型词和介质词是
+    用户的词汇，描述词是用户的话，封装名在判定时就已经被 canon_package
+    规约过一次了（规约结果只用于比较，不改写用户写下的字）。
+
+    四条边界，都是有意的：
+
+    1. **不做浮点往返。** 只对原字符串做后缀替换，数字字面量一个字符都不动。
+       所以 `0.1uF` 不会因为「换算成 100nF 更整齐」而变，`1e-7F` 也不会被重排成
+       另一种写法。重新格式化数值是另一件事——那会连「我当初写的是多少」一起
+       抹掉，而这个库的价值恰恰在于它记的是你写的东西。
+    2. **中文单位原样保留**（`1欧` / `1伏` / `1瓦`）。那是同一件事的另一种语言，
+       不是同一种写法的两种拼法。ASCII 的简写与全称（`r` / `ohm`）才算写法差异，
+       统一归到符号。
+    3. **`M` 与 `m` 永不互换**，前缀一律照抄。它俩在本项目语义相反（兆 vs 毫），
+       整个 normalize_text 不做 casefold 就是为了这条。
+    4. **电阻带非歧义前缀时省略 Ω**：`10kR` → `10k`。裸前缀 `10k` 已经是本项目
+       认的电阻惯例（惯例表里 k/M 指向电阻），省掉冗余的 Ω 更接近手写习惯。
+       但 `u`/`n`/`m` 是歧义前缀（`1m` 说不清是毫欧还是别的），所以 `1mR` 保留
+       Ω 写成 `1mΩ`。判据直接复用 _AMBIGUOUS_PREFIX，不另立一套。
+    """
+    t = normalize_text(tag)
+    m = _PLAIN_RE.match(t)
+    if m is None:
+        return t
+    num, tail = m.group("num"), m.group("tail")
+    if not tail:
+        return t
+    low = tail.lower()
+    for alias, dim in UNIT_SUFFIXES:  # 已按长度降序：`Hz` 必须排在 `h` 前面
+        if len(tail) < len(alias) or not low.endswith(alias.lower()):
+            continue
+        if not alias.isascii():
+            return t  # 中文单位不归符号域
+        head = tail[: len(tail) - len(alias)]
+        if head and head not in PREFIX_STRICT and head not in PREFIX_LENIENT:
+            # 前缀非法，整个尾巴作废——`1N4148` 的 `N4148` 走这一支，
+            # 于是二极管型号不会被改写成 `1N4148F` 之类。
+            return t
+        if dim == "resistance" and head and head not in _AMBIGUOUS_PREFIX:
+            return num + head
+        return num + head + _CANON_UNIT[dim]
+    return t
+
+
+def slot_groups(tags):
+    """按显示槽位把标签分组，槽内保持原有相对顺序。
+
+    返回 {槽位: [标签…]}，键固定是 SLOT_ORDER 那六个（没用到的槽是空列表）。
+    分槽的判据全部来自 classify_tags 的 slot_of，这里只做分组，一个谓词都不重复。
+    """
+    groups = {s: [] for s in SLOT_ORDER}
+    # zip 不会截断出错：slot_of 由 classify_tags 逐位生成，长度必然相等。
+    for tag, slot in zip(tags, classify_tags(tags).slot_of):
+        groups[slot].append(tag)
+    return groups
+
+
+def canonical_tags(tags):
+    """标签的规范形式：先规整写法，再按槽位重排。
+
+    这是**存盘与显示共用的唯一入口**。存盘路径（save_inventory）对每条记录跑
+    一遍，于是「规范化」和「迁移」是同一件事——写入一次，库里所有记录的标签
+    一起收敛，不需要单独的迁移步骤。这个函数是幂等的，第二遍不会再变。
+
+    写法规整在重排之前做：槽位判定认的是规整后的写法（`10kR` 与 `10k` 都落主值，
+    但先归一再判，省得将来两种写法判出两个槽）。
+    """
+    fixed = [canon_unit(t) for t in tags]
+    groups = slot_groups(fixed)
+    return [tag for slot in SLOT_ORDER for tag in groups[slot]]
 
 
 _TYPE_HINT = "C R L D Q U J SW XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X"
@@ -1568,7 +1709,8 @@ def extract_stock_tags(tags):
     """从标签里摘出存量写法，返回 (剩余标签, Stock 或 None, 问题列表)。
 
     存量是独立字段、不是元件的属性，所以命中的标签会被**摘掉**而不是留在 tags 里。
-    这与「标签原样存盘」不冲突——存量从来就不在标签里。
+    这在标签已经会被规范化（见 canonical_tags）之后依然成立——存量根本不在标签里，
+    没有可规范化的写法。
 
     放在数据层而不是归一化层，是因为它产出 Stock 对象，而归一化层不该反向
     依赖数据层。不抛异常、把问题作为数据返回，与 classify_tags 同风格，
@@ -1819,7 +1961,23 @@ def save_inventory(inv):
 
     绝不就地 open(path, "w")：写到一半断电会留下截断的 JSON。
     也绝不因为重试失败而退回直接覆盖写——那正是要避免的写坏路径。
+
+    **写盘前把每条记录的标签走一遍 canonical_tags。** 于是「规范化」和「迁移」
+    是同一件事：写入一次，全库的标签一起收敛到规范写法与槽位顺序，不需要单独的
+    迁移命令。这是本函数唯一的副作用，它是有意的，代价是**你改一条记录，全库
+    的标签都会被顺带规范化**（幂等，跑第二遍不会再变）——换来的是零迁移成本。
+    迁移前的那一版会原封不动落在 .bak 里。
+
+    这里改的是内存里的对象（而不是只在 payload 上改），因为调用方在这之后还会
+    用同一批组件算回显与提示，两边必须是同一个样子。
+
+    **每条记录的 updated_at 不动。** 规范化改的是标签的写法和顺序，不是元件的
+    内容；把全库 17 条都标成「今天更新」会污染「什么时候加的」这个信号——那是
+    created_at 之外的唯一线索。文件级的 updated_at 照旧由本函数更新。
     """
+    for comp in inv.components:
+        comp.tags = canonical_tags(comp.tags)
+
     inv.updated_at = _now()
     payload = json.dumps(inv.to_dict(), ensure_ascii=False, indent=2) + "\n"
 
@@ -1875,31 +2033,80 @@ def pad(s, width, align="<"):
     return s + " " * gap
 
 
+# 单个槽位列的宽度上限。和原来的 min(w, 60) 一个意思，只是分槽之后每列天然更短，
+# 上限跟着调到「一个语义字段不会超过这么多列」的量级（`共阴绿红` 是 8 列，
+# `SOD-123` 是 7 列，16 有一倍余量）。
+#
+# 它是**软**上限：超了只是不再补空格，不截断。截断会丢字符，与「显示层不改写
+# 任何字符」冲突；代价是一条啰嗦的记录仍会把它那行撑开，与改动前一致。
+SLOT_CAP = 16
+
+
+def format_slot_table(rows, indent="", gap="  ", cap=SLOT_CAP):
+    """把一排元件排成按槽位分列、彼此对齐的表，返回行文本（不打印）。
+
+    rows 的每一项是 (前导列, 标签, 尾列)：前导列与尾列都是字符串元组，分别放
+    `[i]` / `#序号` 和 `存量: …` 这类；中间那段标签由本函数按 SLOT_ORDER 分列。
+
+    空槽的列不出现——结果集里没有任何一行用到的槽整列不占位，所以搜电阻时
+    不会平白多出「电气参数」「介质」两段空白。某一行缺的槽由 pad("", w) 补齐，
+    列仍然是对齐的。
+
+    这个函数是四个表格渲染点的公共实现（search 的命中表、list 表、多命中时的
+    候选表、交互模式的候选列表）。之前它们各自抄了一遍「算宽度 + 封顶 + 补空格」，
+    抄出三份不同的列间距和两种标签排法。
+    """
+    rows = list(rows)
+    if not rows:
+        return []
+
+    cells = []
+    for _lead, tags, _tail in rows:
+        g = slot_groups(tags)
+        cells.append([" ".join(g[s]) for s in SLOT_ORDER])
+
+    used = [i for i in range(len(SLOT_ORDER)) if any(c[i] for c in cells)]
+    wslot = {i: min(max(display_width(c[i]) for c in cells), cap) for i in used}
+
+    nlead, ntail = len(rows[0][0]), len(rows[0][2])
+    wlead = [max(display_width(r[0][j]) for r in rows) for j in range(nlead)]
+    wtail = [max(display_width(r[2][j]) for r in rows) for j in range(ntail)]
+
+    lines = []
+    for (lead, _tags, tail), c in zip(rows, cells):
+        parts = [pad(lead[j], wlead[j]) for j in range(nlead)]
+        parts += [pad(c[i], wslot[i]) for i in used]
+        parts += [pad(tail[j], wtail[j]) for j in range(ntail)]
+        lines.append((indent + gap.join(parts)).rstrip())
+    return lines
+
+
+def format_tag_line(tags):
+    """单行显示用的标签文本：按槽位重排，单空格连接，不做列对齐。
+
+    用在只有一条元件的场合（`show`、add / stock / remove 的回显）——没有并排的
+    行就没有对齐这回事，那里剩下的诉求只有「和别处顺序一致」。
+    """
+    g = slot_groups(tags)
+    return " ".join(" ".join(g[s]) for s in SLOT_ORDER if g[s])
+
+
 def render_hits(hits, tokens, show_reason=True):
     if not hits:
         print("没有匹配的元件。")
         print("提示：用 -A/--any 放宽为「任一命中」；或检查标签的写法。")
         return
 
-    rows = []
-    for i, h in enumerate(hits, 1):
-        c = h.component
+    rows = [
+        ((f"[{i}]", f"#{c.seq}"), tuple(c.tags), (f"存量: {c.stock.label()}",))
+        for i, c in enumerate((h.component for h in hits), 1)
+    ]
+    # 命中原因追加在对齐之后，不参与列宽计算——它是行尾的注解，不是一列数据。
+    for line, h in zip(format_slot_table(rows), hits):
         reasons = "  ".join(r for (_, r, _) in h.per_token if r) if show_reason else ""
-        rows.append([
-            f"[{i}]",
-            f"#{c.seq}",
-            " ".join(c.tags),
-            f"存量: {c.stock.label()}",
-            reasons,
-        ])
-
-    w = [max(display_width(r[i]) for r in rows) for i in range(4)]
-    w[2] = min(w[2], 60)  # 标签列过长时不再撑宽
-    for r in rows:
-        line = "  ".join(pad(r[i], w[i]) for i in range(4))
-        if r[4]:
-            line += f"  ← {r[4]}"
-        print(line.rstrip())
+        if reasons:
+            line += f"  ← {reasons}"
+        print(line)
     print(f"\n共 {len(hits)} 条")
 
 
@@ -1907,13 +2114,12 @@ def render_components(components, title=None):
     if not components:
         print("库存为空。")
         return
-    rows = []
-    for c in components:
-        rows.append([f"#{c.seq}", " ".join(c.tags), f"存量: {c.stock.label()}"])
-    w0 = max(display_width(r[0]) for r in rows)
-    w1 = min(max(display_width(r[1]) for r in rows), 60)
-    for r in rows:
-        print(f"{pad(r[0], w0)}  {pad(r[1], w1)}  {r[2]}".rstrip())
+    rows = [
+        ((f"#{c.seq}",), tuple(c.tags), (f"存量: {c.stock.label()}",))
+        for c in components
+    ]
+    for line in format_slot_table(rows):
+        print(line)
     print(f"\n共 {len(components)} 条")
 
 
@@ -2074,8 +2280,11 @@ def _require_single(inv, words, verb):
         raise AppError(f"没有匹配的元件：{target_desc}", EXIT_NOTFOUND)
     if len(found) > 1:
         lines = [f"匹配到 {len(found)} 个元件，无法确定要{verb}哪一个。请收窄条件或改用 #序号："]
-        for i, c in enumerate(found[:20], 1):
-            lines.append(f"  [{i}] #{c.seq}  {' '.join(c.tags)}  存量: {c.stock.label()}")
+        rows = [
+            ((f"[{i}]", f"#{c.seq}"), tuple(c.tags), (f"存量: {c.stock.label()}",))
+            for i, c in enumerate(found[:20], 1)
+        ]
+        lines.extend(format_slot_table(rows, indent="  "))
         if len(found) > 20:
             lines.append(f"  …… 还有 {len(found) - 20} 个")
         raise AppError("\n".join(lines), EXIT_USAGE)
@@ -2137,11 +2346,12 @@ def cmd_add(args, path, extra_package=None):
         # 一次报出全部问题，不修一个报一个：命令行下每次重试都要重启进程。
         raise AppError(render_issues(plan, tags), EXIT_USAGE)
     if plan.added_type:
-        # 补在索引 0，贴合 `C 0805 贴片 100nF 50V` 的书写习惯。用户已经写下的
-        # 标签一律不动、不重排、不做规范化改写——标签原样存盘。
+        # 补在索引 0，贴合 `C 0805 贴片 100nF 50V` 的书写习惯。顺序的最终裁决权
+        # 在 canonical_tags（存盘与显示都过它），这里只是让内存里的列表当场就能
+        # 读——本函数后面还有分支要用 tags 算提示，不必先跑一遍规范化。
         tags.insert(0, plan.added_type)
     if plan.added_medium:
-        # 介质紧挨着类型放，读起来是 `C MLCC 0805 100nF`。
+        # 介质紧挨着类型放，读起来是 `C MLCC 0805 100nF`。理由同上。
         pos = next((i for i, t in enumerate(tags) if canon_type(t) is not None), 0)
         tags.insert(pos + 1, plan.added_medium)
     if plan.absorbed:
@@ -2163,7 +2373,10 @@ def cmd_add(args, path, extra_package=None):
     inv.components.append(comp)
     save_inventory(inv)
 
-    print(f"已添加 #{comp.seq}  {' '.join(tags)}   存量: {stock.label()}")
+    # 回显用的是 comp.tags，不是上面那个局部 tags：save_inventory 刚把存盘的标签
+    # 规范化过（写法规整 + 槽位重排），结果写回了 comp.tags，而局部 tags 还停在
+    # 规范化之前。回显必须和用户打开 JSON 看到的那一份一致。
+    print(f"已添加 #{comp.seq}  {format_tag_line(comp.tags)}   存量: {stock.label()}")
     # 自动补全是在改用户的数据，比匹配更需要解释自己。项目里反复强调的
     # 「模糊匹配必须能解释自己」在这里同样适用，而且这里的要求更高。
     if plan.added_type:
@@ -2180,10 +2393,10 @@ def cmd_add(args, path, extra_package=None):
 
     # 防重复录入提示。不阻断——同一批电容分两袋放是合法的。
     others = [c for c in inv.components if c.seq != comp.seq]
-    similar = search_components(others, tags)
+    similar = search_components(others, comp.tags)
     if similar and similar[0].score >= 0.9:
         c = similar[0].component
-        print(f"注意：库中已有相似的 #{c.seq}  {' '.join(c.tags)}（匹配度 {similar[0].score:.2f}）")
+        print(f"注意：库中已有相似的 #{c.seq}  {format_tag_line(c.tags)}（匹配度 {similar[0].score:.2f}）")
     return EXIT_OK
 
 
@@ -2194,7 +2407,7 @@ def cmd_stock(args, path):
     comp.stock = make_stock(args)
     comp.updated_at = _now()
     save_inventory(inv)
-    print(f"#{comp.seq}  {' '.join(comp.tags)}   存量: {old} → {comp.stock.label()}")
+    print(f"#{comp.seq}  {format_tag_line(comp.tags)}   存量: {old} → {comp.stock.label()}")
     return EXIT_OK
 
 
@@ -2221,7 +2434,7 @@ def cmd_show(args, path):
         raise AppError(f"没有匹配的元件：{' '.join(args.target)}", EXIT_NOTFOUND)
     for c in found:
         print(f"#{c.seq}  {c.id}")
-        print(f"  标签: {' '.join(c.tags)}")
+        print(f"  标签: {format_tag_line(c.tags)}")
         print(f"  存量: {c.stock.label()}")
         if c.note:
             print(f"  备注: {c.note}")
@@ -2240,7 +2453,7 @@ def cmd_remove(args, path):
     # next_seq 不回收：删除后 #7 不会再被分配给新元件，
     # 否则用户记下的 #7 会悄悄指向另一个东西。
     save_inventory(inv)
-    print(f"已删除 #{comp.seq}  {' '.join(comp.tags)}")
+    print(f"已删除 #{comp.seq}  {format_tag_line(comp.tags)}")
     return EXIT_OK
 
 
@@ -2424,6 +2637,77 @@ def run_selftest():
     # --- 显示宽度 ---
     eq(display_width("电容"), 4, "中文按 2 列宽计算")
     eq(display_width("0805"), 4, "ASCII 按 1 列宽计算")
+
+    # --- 单位写法规范化 ---
+    #
+    # 这一组钉的是「什么会被改写、什么绝不改写」。改写只发生在
+    # 「数字 + ASCII 单位简写」这一种形态上——它是全项目唯一同一个量有好几种
+    # 写法的地方。用户的词汇（类型词、介质词、描述词、封装名）不是拼写错误的
+    # 来源，一个字符都不碰。
+    for raw, want in (("51r", "51Ω"), ("51R", "51Ω"), ("51Ω", "51Ω"),
+                      ("220R", "220Ω"), ("150R", "150Ω"), ("10kR", "10k"),
+                      ("1MR", "1M"), ("16v", "16V"), ("50v", "50V"),
+                      ("25v", "25V"), ("0.25w", "0.25W"), ("1ohm", "1Ω"),
+                      ("35V", "35V"), ("2.2uF", "2.2uF")):
+        eq(canon_unit(raw), want, f"单位写法规范化 {raw!r}")
+    for raw in ("4k7", "1k2", "2R2", "0R05", "1e-7F", "0.1uF", "100n", "1k", "10k",
+                "0805", "0402", "2.54", "5x11", "5mm", "1%", "1N4148", "1000",
+                "X7R", "16MHz", "1kHz", "10uH", "1M", "1m", "1欧", "1伏", "1瓦",
+                "直插", "贴片", "led", "排母", "MLCC", "瓷片", "铝电解", "共阴绿红",
+                "黄", "Case A", "无封装", "NO PACKAGE"):
+        eq(canon_unit(raw), raw, f"不该改写的标签 {raw!r}")
+    eq(canon_unit("1mR"), "1mΩ", "m 是歧义前缀：1mR 保留 Ω，裸写 1m 分不清兆毫")
+    eq(canon_unit("10KR"), "10K", "前缀照抄不换大小写，只省掉冗余的 Ω")
+
+    # --- 显示槽位与规范顺序 ---
+    #
+    # `1k` / `4k7` / `3p` 这一组是回归防线：parse_quantity 对裸前缀与中缀写法
+    # 刻意返回 dim=None（维度歧义留到有上下文时再消解），谁要是按「dim 属于某几个
+    # 维度」来判主值，它们就会掉进「其它」列，`R 10k 直插` 会排成 `R 直插 10k`。
+    for tags, want in (
+        (["C", "0805", "100nF", "50V", "MLCC"], ["C", "100nF", "50V", "MLCC", "0805"]),
+        (["R", "10k", "直插"], ["R", "10k", "直插"]),
+        (["R", "直插", "10k"], ["R", "10k", "直插"]),
+        (["R", "0.25w", "10kR", "直插"], ["R", "10k", "0.25W", "直插"]),
+        (["R", "0603", "51r", "1%"], ["R", "51Ω", "1%", "0603"]),
+        (["3p", "排母", "2.54"], ["排母", "3p", "2.54"]),
+        (["D", "SOD-123", "1N4148"], ["D", "1N4148", "SOD-123"]),
+        (["共阴绿红", "led", "直插"], ["led", "直插", "共阴绿红"]),
+        (["C", "100nF", "无封装"], ["C", "100nF", "无封装"]),
+        # 同一槽里的多个标签保持原相对顺序（`R` 和 `色环` 都在类型槽，
+        # 它们在渲染时合成一个单元格，但 canonical_tags 只重排、不合并 token）。
+        (["R", "色环", "4k7", "直插"], ["R", "色环", "4k7", "直插"]),
+        # 槽内**稳定**排序：`直插` 和 `0805` 同在封装槽，输入里谁在前谁就留在前
+        # （实际录入时 `0805` 会把冗余的 `直插` 吸收掉，这里只钉排序规则本身）。
+        (["直插", "MLCC", "0805", "50V", "100nF", "C"],
+         ["C", "100nF", "50V", "MLCC", "直插", "0805"]),
+    ):
+        eq(canonical_tags(tags), want, f"规范顺序 {tags}")
+        eq(canonical_tags(want), want, f"规范化必须幂等 {tags}")
+
+    # 分槽的判据只有 classify_tags 一处，渲染与重排都读它的 slot_of。
+    eq(len(classify_tags(["C", "0805", "100nF"]).slot_of), 3, "slot_of 与 tags 逐位对齐")
+    eq(set(classify_tags(["C", "0805", "100nF"]).slot_of), {"type", "package", "main"},
+       "slot_of 只产出 SLOT_ORDER 里的名字")
+
+    # --- 单行回显与表格对齐 ---
+    eq(format_tag_line(["0805", "100nF", "C"]), "C 100nF 0805", "单行回显按槽位重排")
+    eq(format_slot_table([]), [], "空表返回空列表")
+    _rows = [
+        (("#1",), ("C", "100nF", "50V", "0805"), ("存量: 多(3)",)),
+        (("#2",), ("C", "1uF", "16V", "5x11"), ("存量: 多(3)",)),
+    ]
+    eq(format_slot_table(_rows),
+       ["#1  C  100nF  50V  0805  存量: 多(3)",
+        "#2  C  1uF    16V  5x11  存量: 多(3)"],
+       "槽位列各自补空格对齐")
+    # 某一行缺的槽由空格占位，尾列（存量）仍在同一列；一行都没有用到的槽整列不出现。
+    _rows.append((("#3",), ("R", "10k", "直插"), ("存量: 多(3)",)))
+    _lines = format_slot_table(_rows)
+    eq(len({display_width(l[: l.index("存量:")]) for l in _lines}), 1,
+       "缺槽的行也要把尾列推到同一列")
+    ok("MLCC" not in "".join(_lines), "一行都没有用到的槽整列不出现")
+    eq(_lines[2], "#3  R  10k         直插  存量: 多(3)", "中间的空槽按宽度留白")
 
     # --- argv 重写 ---
     eq(normalize_argv(["--search", "51R"]), ["search", "51R"], "--search 应被重写")
