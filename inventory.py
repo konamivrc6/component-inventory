@@ -1974,10 +1974,6 @@ class Inventory:
     def find_by_seq(self, seq):
         return [c for c in self.components if c.seq == seq]
 
-    def find_by_id_prefix(self, prefix):
-        p = prefix.lower().replace("-", "")
-        return [c for c in self.components if c.id.lower().replace("-", "").startswith(p)]
-
 
 def _now():
     return datetime.now().astimezone().replace(microsecond=0).isoformat()
@@ -2192,9 +2188,9 @@ def format_slot_table(rows, indent="", gap="  ", cap=SLOT_CAP):
     不会平白多出「电气参数」「介质」两段空白。某一行缺的槽由 pad("", w) 补齐，
     列仍然是对齐的。
 
-    这个函数是四个表格渲染点的公共实现（search 的命中表、list 表、多命中时的
-    候选表、交互模式的候选列表）。之前它们各自抄了一遍「算宽度 + 封顶 + 补空格」，
-    抄出三份不同的列间距和两种标签排法。
+    这个函数是三个表格渲染点的公共实现（search 的命中表、list 表、包含关系说明
+    里的表格）。之前它们各自抄了一遍「算宽度 + 封顶 + 补空格」，抄出三份不同的
+    列间距和两种标签排法。
     """
     rows = list(rows)
     if not rows:
@@ -2224,11 +2220,32 @@ def format_slot_table(rows, indent="", gap="  ", cap=SLOT_CAP):
 def format_tag_line(tags):
     """单行显示用的标签文本：按槽位重排，单空格连接，不做列对齐。
 
-    用在只有一条元件的场合（`show`、add / stock / remove 的回显）——没有并排的
+    用在只有一条元件的场合（add / stock / remove 的回显）——没有并排的
     行就没有对齐这回事，那里剩下的诉求只有「和别处顺序一致」。
     """
     g = slot_groups(tags)
     return " ".join(" ".join(g[s]) for s in SLOT_ORDER if g[s])
+
+
+def attach_notes(lines, components, indent="  "):
+    """把备注挂到对应元件那一行的下面，返回新的行列表。
+
+    备注是自由文本、长度不定，不能当作一列参与 format_slot_table 的列宽计算，
+    否则一条长备注会把整张表撑变形。所以它另起一行、缩进两格——和删除确认里
+    那一行同一套写法。
+
+    两个表格渲染点（search 的命中表、list 表）共用这一份排版：备注挂在哪、
+    缩进多少，只有这一处说了算。
+
+    也不用行尾的 `←` 尾注放它：那个记号在 search 里已经是「命中原因」，
+    一个记号不该有两种含义。
+    """
+    out = []
+    for line, c in zip(lines, components):
+        out.append(line)
+        if c.note:
+            out.append(f"{indent}备注: {c.note}")
+    return out
 
 
 def render_hits(hits, tokens, show_reason=True):
@@ -2242,10 +2259,12 @@ def render_hits(hits, tokens, show_reason=True):
         for i, c in enumerate((h.component for h in hits), 1)
     ]
     # 命中原因追加在对齐之后，不参与列宽计算——它是行尾的注解，不是一列数据。
-    for line, h in zip(format_slot_table(rows), hits):
+    lines = format_slot_table(rows)
+    for i, h in enumerate(hits):
         reasons = "  ".join(r for (_, r, _) in h.per_token if r) if show_reason else ""
         if reasons:
-            line += f"  ← {reasons}"
+            lines[i] += f"  ← {reasons}"
+    for line in attach_notes(lines, [h.component for h in hits]):
         print(line)
     print(f"\n共 {len(hits)} 条")
 
@@ -2258,7 +2277,7 @@ def render_components(components, title=None):
         ((f"#{c.seq}",), tuple(c.tags), (f"存量: {c.stock.label()}",))
         for c in components
     ]
-    for line in format_slot_table(rows):
+    for line in attach_notes(format_slot_table(rows), components):
         print(line)
     print(f"\n共 {len(components)} 条")
 
@@ -2286,7 +2305,12 @@ def render_containment(relations, tags):
 
 
 def component_to_json(c, score=None, per_token=None):
-    d = {"seq": c.seq, "id": c.id, "tags": list(c.tags), "stock": c.stock.to_dict()}
+    # note 是记录字段，和 tags 同级，所以无条件带上（没有备注时是空串）；score 与
+    # matches 是查询期的注解，才该按需出现。JSON 消费者不该去猜键在不在。
+    #
+    # 创建与更新时间刻意不在这里：它们是工具自己写的时间戳，不是用户录入的内容。
+    d = {"seq": c.seq, "id": c.id, "tags": list(c.tags),
+         "stock": c.stock.to_dict(), "note": c.note}
     if score is not None:
         d["score"] = round(score, 4)
     if per_token is not None:
@@ -2301,7 +2325,7 @@ def component_to_json(c, score=None, per_token=None):
 # 第 6 层：CLI
 # =============================================================================
 
-SUBCOMMANDS = ("search", "add", "stock", "list", "show", "remove")
+SUBCOMMANDS = ("search", "add", "stock", "list", "remove")
 
 # 顶层 flag 语法糖 → 子命令。这样 `--search 51R` 和 `search 51R` 走的是
 # 同一份实现，不存在行为分叉。
@@ -2311,7 +2335,6 @@ ARG_ALIASES = {
     "--list": "list", "-l": "list",
     "--stock": "stock", "--set-stock": "stock",
     "--remove": "remove", "--rm": "remove",
-    "--show": "show",
 }
 
 _GLOBAL_OPTS_WITH_VALUE = {"--file", "-f"}
@@ -2399,9 +2422,6 @@ def build_parser():
     pl.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条")
     pl.add_argument("--low", action="store_true", help="只列出存量偏低的")
     pl.add_argument("--json", action="store_true", help="输出 JSON")
-
-    psh = sub.add_parser("show", parents=[sub_common], help="查看元件详情")
-    psh.add_argument("target", nargs="+", help="元件定位，如 #7 或 51R")
 
     pr = sub.add_parser("remove", parents=[sub_common], help="删除元件")
     pr.add_argument("target", help="元件编号，只写 #编号，如 #7")
@@ -2525,27 +2545,6 @@ def apply_stock_value(current, token, seq):
     return Stock("accurate", count=new)
 
 
-def resolve_target(inv, words):
-    """把目标描述解析成候选元件列表。
-
-    解析顺序：#序号 → id 前缀 → 完整检索逻辑。
-    """
-    text = " ".join(words).strip()
-
-    if text.startswith("#") and text[1:].isdigit():
-        return inv.find_by_seq(int(text[1:]))
-
-    if len(text) >= 4 and _HEX_RE.match(text):
-        found = inv.find_by_id_prefix(text)
-        if found:
-            return found
-
-    tokens = tokenize_query(text)
-    if not tokens:
-        return []
-    return [h.component for h in search_components(inv.components, tokens)]
-
-
 # 改库存与删元件的目标只能是一个 `#编号`。
 #
 # 曾经这里是三层解析（编号 → id 前缀 → 完整检索）。收窄到编号，是因为这两个
@@ -2555,8 +2554,8 @@ def resolve_target(inv, words):
 #
 # 不认裸数字：编号在本项目里始终写作 `#7`，多一种写法就多一条要解释的规则。
 #
-# resolve_target 与 find_by_id_prefix 留着给 cmd_show 用——show 下个版本整个
-# 删掉，那时一并清。
+# id 前缀在这一层不认，但在 search 里认——match_token 的句柄层另有一份独立实现。
+# 找要召回，改要精确。
 _HANDLE_RE = re.compile(r"^#(\d+)$")
 
 
@@ -2755,25 +2754,6 @@ def cmd_list(args, path):
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         render_components(comps)
-    return EXIT_OK
-
-
-def cmd_show(args, path):
-    inv = load_inventory(path)
-    found = resolve_target(inv, args.target)
-    if not found:
-        raise AppError(f"没有匹配的元件：{' '.join(args.target)}", EXIT_NOTFOUND)
-    for c in found:
-        print(f"#{c.seq}  {c.id}")
-        print(f"  标签: {format_tag_line(c.tags)}")
-        print(f"  存量: {c.stock.label()}")
-        if c.note:
-            print(f"  备注: {c.note}")
-        if c.created_at:
-            print(f"  创建: {c.created_at}")
-        if c.updated_at:
-            print(f"  更新: {c.updated_at}")
-        print()
     return EXIT_OK
 
 
@@ -3048,6 +3028,25 @@ def run_selftest():
     ok("MLCC" not in "".join(_lines), "一行都没有用到的槽整列不出现")
     eq(_lines[2], "#3  R  10k         直插  存量: 多(3)", "中间的空槽按宽度留白")
 
+    # --- 备注挂在哪：元件行下面，缩进两格 ---
+    #
+    # show 删掉之后，备注就只剩这里能读了（再就是删除确认那一刻）。它不能当表格的
+    # 一列——自由文本、长度不定，会把列宽撑变形——所以单独占一行。两个渲染点共用
+    # attach_notes，这一组钉的就是那份排版。
+    _note_c1 = Component(id="33333333-3333-3333-3333-333333333333", seq=1,
+                         tags=["C", "1uF", "0805"], stock=Stock("coarse", level=0),
+                         note="只在副本里")
+    _note_c2 = Component(id="44444444-4444-4444-4444-444444444444", seq=2,
+                         tags=["R", "10k", "0805"], stock=Stock("coarse", level=0))
+    eq(attach_notes(["A", "B"], [_note_c1, _note_c2]),
+       ["A", "  备注: 只在副本里", "B"], "备注补在对应元件行的下面，缩进两格")
+    eq(attach_notes(["A", "B"], [_note_c2, _note_c1]),
+       ["A", "B", "  备注: 只在副本里"], "备注跟着它自己那一行，不会串位")
+    eq(attach_notes(["A"], [_note_c2]), ["A"], "没有备注就一行都不多占")
+    eq(attach_notes([], []), [], "空输入返回空列表")
+    eq(component_to_json(_note_c1)["note"], "只在副本里", "--json 结果带 note")
+    eq(component_to_json(_note_c2)["note"], "", "空备注也输出空串，schema 稳定")
+
     # --- 封装追问的回答怎么变成标签 ---
     #
     # 用户在「封装 > 」处答的是一句话，库里存的却是标签。整句原样存下来会造出
@@ -3141,6 +3140,25 @@ def run_selftest():
        ["--file", "x.json", "search", "51R"], "--file 的值不应被误判为查询词")
     eq(normalize_argv(["add", "C", "--search"]), ["add", "C", "--search"],
        "子命令之后的 --search 是标签，不应被重写")
+
+    # --- show 已下线 ---
+    #
+    # 三处命令面必须同去：SUBCOMMANDS、ARG_ALIASES、argparse 的子解析器。少改一处，
+    # normalize_argv 就会放行一个 argparse 不认识的名字，报错变成一句莫名的 usage。
+    ok("show" not in SUBCOMMANDS, "SUBCOMMANDS 不再包含 show")
+    ok("--show" not in ARG_ALIASES, "ARG_ALIASES 不再包含 --show")
+    eq(normalize_argv(["--show", "#7"]), ["--show", "#7"], "--show 不再是子命令别名")
+
+    # --- 句柄层独立于已删的 resolve_target ---
+    #
+    # search 的 #序号 与 id 前缀匹配是 match_token 内联实现的另一份，和 show 用过的
+    # resolve_target 无关。show 一走，这两条路径在自检里就再没有别的断言摸到过，
+    # 而它们正是「找要召回」那一半，所以补在这里。
+    _handle_c = Component(id="11111111-abcd-2222-3333-444444444444", seq=7,
+                          tags=["R", "4k7", "0805"], stock=Stock("coarse", level=0))
+    eq(match_token("#7", _handle_c)[0], 1.0, "search #7 仍走句柄层")
+    eq(match_token("11111111", _handle_c)[0], 1.0, "search 的 id 前缀仍走句柄层")
+    eq(match_token("#8", _handle_c)[0], 0.0, "别的序号不命中")
 
     # --- 封装识别：正例 ---
     for raw, want in (("0805", "0805"), ("0603", "0603"), ("0402", "0402"),
@@ -3727,7 +3745,6 @@ def main(argv=None):
         "add": cmd_add,
         "stock": cmd_stock,
         "list": cmd_list,
-        "show": cmd_show,
         "remove": cmd_remove,
     }
 

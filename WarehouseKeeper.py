@@ -15,9 +15,6 @@ inventory.py，而这只在「作为脚本运行」时成立。
 缺数量、命中包含关系、删除前二次确认，命令行在这些地方要么报错、要么用选项绕过，
 交互场景该问就问。
 
-show 是唯一还吃检索词目标的命令（`show 51R` 命中多条就全列出来）；remove 与
-stock 都只认 `#编号`，和命令行一致。这是暂时的——show 下个版本整个删掉。
-
 明确不做的事：全屏 TUI（当前是 Git Bash 伪终端，msvcrt 与 Windows 控制台 API 都读不到按键）；
 edit 命令（标签写错了 remove 掉重录即可，这是既有决定）。
 """
@@ -43,7 +40,6 @@ from inventory import (
     classify_tags,
     cmd_add,
     cmd_remove,
-    cmd_show,
     cmd_stock,
     default_data_path,
     extract_stock_tags,
@@ -76,7 +72,7 @@ QUIT_WORDS = frozenset({"quit", "exit", ":q", "q"})
 # 每个命令认识的选项。值是一个 (namespace 键, 类型) 元组，类型为 None 表示这是个开关。
 #
 # 这些规格必须与 inventory.py 里 build_parser 的子命令定义保持一致——我们复用
-# cmd_add、cmd_stock、cmd_remove、cmd_show，靠 SimpleNamespace 构造形状相同的假 args。
+# cmd_add、cmd_stock、cmd_remove，靠 SimpleNamespace 构造形状相同的假 args。
 ADD_SPEC = {"--level": ("level", int), "--qty": ("qty", int), "--note": ("note", str),
             "--force": ("force", None)}
 STOCK_SPEC = {"--level": ("level", int), "--qty": ("qty", int)}
@@ -96,7 +92,6 @@ HELP_TEXT = """\
   add    标签...                 添加元件（缺封装或数量时会问你；类型能推断的会自动补；与已有元件重复时会确认）
   stock  #编号 [值]              更改存量（值可以直接写：多 / plenty / 23 / +5）
   list                           列出全部（--low 只看存量偏低的）
-  show   目标                    查看详情（唯一还认检索词定位的命令，命中多个会全部列出）
   remove #编号                   删除元件（会二次确认）
   help                           显示本帮助
   selftest                       跑一遍 inventory.py 的内置自检
@@ -105,7 +100,7 @@ HELP_TEXT = """\
 选项
   --level 0-4     粗略存量：0 无 / 1 极少 / 2 少 / 3 多 / 4 极多
   --qty N         精确存量个数（与 --level 互斥）
-  --note 文本     备注（只有 add 有）
+  --note 文本     备注（只有 add 有；会显示在 list 与 search 里）
   --force         与库中元件重复或包含时仍然添加，不追问（只有 add 有）
   -A, --any       检索时放宽为「任一命中」，默认是全部命中
   -n N            最多显示 N 条（默认 20）
@@ -113,7 +108,6 @@ HELP_TEXT = """\
 目标怎么写
   #7              永久编号为 7 的元件。编号只增不减，删除后不回收
   stock / remove  只认 #编号。写检索词会报错，先去 search 查到编号再动手
-  show            还认检索词与 id 前缀（51R / a1b2c3），命中多个就全部列出来
 
 stock 的值怎么写
   多 / 很少 / plenty      粗略档位，词表整套都认：无 极少 少 多 极多，英文 none few some many lots
@@ -476,13 +470,6 @@ def do_list(rest, path):
     return EXIT_OK
 
 
-def do_show(rest, path):
-    if not rest:
-        raise AppError("show 需要目标，例如：show #7", EXIT_USAGE)
-    # 查看是只读操作，命中多条就全列出来，不强迫用户先选一个。
-    return cmd_show(SimpleNamespace(target=rest), path)
-
-
 def confirm_remove(comp, path):
     """把要删的元件摊开，再问一次。
 
@@ -526,7 +513,6 @@ COMMANDS = {
     "add": do_add,
     "stock": do_stock,
     "list": do_list,
-    "show": do_show,
     "remove": do_remove,
     "help": do_help,
     "selftest": do_selftest,
