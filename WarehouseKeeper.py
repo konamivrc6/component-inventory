@@ -46,6 +46,7 @@ from inventory import (
     format_tag_line,
     load_inventory,
     render_components,
+    render_containment,
     render_hits,
     resolve_package_answer,
     resolve_target,
@@ -75,7 +76,8 @@ QUIT_WORDS = frozenset({"quit", "exit", ":q", "q"})
 #
 # 这些规格必须与 inventory.py 里 build_parser 的子命令定义保持一致——我们复用 cmd_add
 # 和 cmd_show，靠 SimpleNamespace 构造出形状相同的假 args。
-ADD_SPEC = {"--level": ("level", int), "--qty": ("qty", int), "--note": ("note", str)}
+ADD_SPEC = {"--level": ("level", int), "--qty": ("qty", int), "--note": ("note", str),
+            "--force": ("force", None)}
 STOCK_SPEC = {"--level": ("level", int), "--qty": ("qty", int)}
 SEARCH_SPEC = {
     "-A": ("any", None), "--any": ("any", None),
@@ -90,7 +92,7 @@ LIST_SPEC = {
 HELP_TEXT = """\
 命令
   search 查询词...               检索（多个词之间是「全部命中」）
-  add    标签...                 添加元件（缺封装或数量时会问你；类型能推断的会自动补）
+  add    标签...                 添加元件（缺封装或数量时会问你；类型能推断的会自动补；与已有元件重复时会确认）
   stock  目标                    更改存量（需要 --level 或 --qty）
   list                           列出全部（--low 只看存量偏低的）
   show   目标                    查看详情
@@ -103,6 +105,7 @@ HELP_TEXT = """\
   --level 0-4     粗略存量：0 无 / 1 极少 / 2 少 / 3 多 / 4 极多
   --qty N         精确存量个数（与 --level 互斥）
   --note 文本     备注（只有 add 有）
+  --force         与库中元件重复或包含时仍然添加，不追问（只有 add 有）
   -A, --any       检索时放宽为「任一命中」，默认是全部命中
   -n N            最多显示 N 条（默认 20）
 
@@ -435,10 +438,26 @@ def ensure_stock(tags, opts):
         return ans, False
 
 
+def confirm_containment(relations, tags):
+    """把包含关系摊开，再问要不要照加。
+
+    整块渲染复用 render_containment——它在命令行那边是报错正文，在这里是追问的
+    上下文，同一句话不允许出现第二份。本函数只管缩进和追问，和 do_remove 先把
+    详情摊开再确认是同一个套路。
+    """
+    for line in render_containment(relations, tags).splitlines():
+        sub_print(line)
+    if confirm("仍然添加？(y/N) > "):
+        return True
+    # 取消的结果行顶格：追问一有答案，缩进就结束，结果回到第一列。
+    print("已取消。")
+    return False
+
+
 def do_add(rest, path):
     opts, tags = scan_options(rest, ADD_SPEC)
     if not tags:
-        raise AppError("至少要有一个标签。用法：add 标签... [--level 0-4 | --qty N] [--note 文本]",
+        raise AppError("至少要有一个标签。用法：add 标签... [--level 0-4 | --qty N] [--note 文本] [--force]",
                        EXIT_USAGE)
 
     # 这一条必须自己挡。make_stock 自己不检查互斥——它先判 qty 后判 level，
@@ -459,21 +478,26 @@ def do_add(rest, path):
         # 只是把答案拼回标签，解析交给 cmd_add——规则只有一份。
         tags = tags + [extra]
 
-    # 复用 cmd_add，这样标签归一化、未指定存量的提示、重复录入的相似度提醒、
-    # next_seq 递增、原子保存全都是命令行那份实现，不会漂移。
+    # 复用 cmd_add，这样标签归一化、未指定存量的提示、包含关系检查、next_seq
+    # 递增、原子保存全都是命令行那份实现，不会漂移。
     #
     # SimpleNamespace 的字段形状对应 build_parser 里 add 子命令的定义。注意 cmd_add
     # 用 `args.level is None` 这样的属性访问而非 getattr，所以 level 和 qty
-    # **必须存在**（值是 None 也行），少一个就是运行时 AttributeError。
+    # **必须存在**（值是 None 也行），少一个就是运行时 AttributeError。force 则
+    # 相反：cmd_add 用 getattr(args, "force", False) 读它，字段缺失会静默退化成
+    # False，把 --force 重新变成被自己的追问挡住，所以它也必须在这儿出现。
     return cmd_add(
         SimpleNamespace(
             tags=tags,
             level=opts.get("level"),
             qty=opts.get("qty"),
             note=opts.get("note", ""),
+            force=bool(opts.get("force")),
         ),
         path,
         extra_package=provided,
+        # 永远传回调；--force 的判定只发生在 cmd_add 里，这一层不分叉。
+        confirm=confirm_containment,
     )
 
 

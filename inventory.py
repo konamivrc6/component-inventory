@@ -1504,7 +1504,8 @@ def match_token(q, comp):
     """一个查询词对一个元件的最佳匹配。返回 (分数, 命中原因)。
 
     分两层调度：句柄（#序号 / id 前缀）直接判定；复合词（`贴片电容`）
-    展开后要求**每一部分都命中**，取最弱一环的分数。
+    展开后要求**每一部分都命中**，取最弱一环的分数。单层判定本身在
+    _match_tags 里——包含判定直接用它，绕开上面这两层。
     """
     qn = normalize_text(q)
     if not qn:
@@ -1532,28 +1533,35 @@ def match_token(q, comp):
     if len(parts) > 1:
         scores, reasons = [], []
         for part in parts:
-            s, r = _match_simple(part, comp)
+            s, r = _match_tags(part, comp.tags)
             if s <= 0:
                 return 0.0, None
             scores.append(s)
             reasons.append(r)
         return min(scores), "  ".join(reasons)
 
-    return _match_simple(qn, comp)
+    return _match_tags(qn, comp.tags)
 
 
-def _match_simple(qn, comp):
-    """单个（已展开的）词对元件的分层匹配，首个成功即返回。
+def _match_tags(qn, tags):
+    """单个（已展开的）词对**一组标签**的分层匹配，首个成功即返回。
 
     首个成功即返回是刻意的：这样高分的精确匹配不会被低分的降级路径覆盖。
+
+    只吃标签列表而不是整个元件，是为了让包含判定（find_containment）也用得上
+    这份分层。它问的是「这两组标签是不是同一批东西」，不该经过 match_token
+    外面那两层**只服务于查询**的调度：句柄层（`#7` 是一条标签时不该去命中序号）
+    和复合词展开层（一个标签 `贴片电容` 不该被当成「同时有 贴片 和 C」）。
+
+    qn 假定已过 normalize_text，hint 一律从 tags 自身的类型标签推。
     """
-    hint = dim_hint_for_tags(comp.tags)
+    hint = dim_hint_for_tags(tags)
     qq = parse_quantity(qn, hint=hint)
 
     # --- 第 1 层：物理量等价 ---
     if qq is not None:
         best = None
-        for tag in comp.tags:
+        for tag in tags:
             tq = parse_quantity(tag, hint=hint)
             if tq is None or not quantities_equal(qq, tq):
                 continue
@@ -1578,7 +1586,7 @@ def _match_simple(qn, comp):
     # --- 第 2 层：类型归约 ---
     qc = canon_type(qn)
     if qc is not None:
-        for tag in comp.tags:
+        for tag in tags:
             if canon_type(tag) != qc:
                 continue
             if normalize_text(tag) == qn:
@@ -1591,7 +1599,7 @@ def _match_simple(qn, comp):
     # 而放宽那条例外会牵动 ASCII 单字符的行为，不值得。
     qm = canon_medium(qn)
     if qm is not None:
-        for tag in comp.tags:
+        for tag in tags:
             if canon_medium(tag) != qm:
                 continue
             if normalize_text(tag) == qn:
@@ -1604,7 +1612,7 @@ def _match_simple(qn, comp):
     # 承诺要解决的事。
     qp = canon_package(qn)
     if qp is not None:
-        for tag in comp.tags:
+        for tag in tags:
             if canon_package(tag) != qp:
                 continue
             if normalize_text(tag) == qn:
@@ -1613,7 +1621,7 @@ def _match_simple(qn, comp):
 
     # --- 第 3 层：字符串全等 ---
     qkey = qn.casefold()
-    for tag in comp.tags:
+    for tag in tags:
         if normalize_text(tag).casefold() == qkey:
             return 1.0, tag
 
@@ -1627,14 +1635,14 @@ def _match_simple(qn, comp):
     # 会被这一层当成安装方式查询，把原有的字符串匹配行为打坏。
     qmt = _PACKAGE_MOUNT_MAP.get(_pkg_key(qn))
     if qmt in (_MOUNT_SMD, _MOUNT_THT):
-        for tag in comp.tags:
+        for tag in tags:
             pkg = canon_package(tag)
             if pkg is not None and package_mount(pkg) == qmt:
                 return 0.9, f"{pkg}（{qmt}）"
 
     # --- 第 4 层：子串 ---
     best = None
-    for tag in comp.tags:
+    for tag in tags:
         s = _substring_score(qn, normalize_text(tag))
         if s > 0 and (best is None or s > best[0]):
             # 用 `~` 而不是数学的 ⊂：后者 GBK 编不出来，在代码页 936 的
@@ -1690,6 +1698,91 @@ def search_components(components, tokens, any_mode=False, limit=None):
     if limit is not None:
         results = results[:limit]
     return results
+
+
+# 包含判定的得分门槛。匹配层里 ≥0.9 的来源只有这么几种：字符串全等（1.0）、
+# 双方维度都明确的物理量等价（1.0）、类型/介质/封装/安装方式四种归约（0.9）。
+# 它们共同的含义是「同一条信息的另一种写法」，正是集合包含要的语义。
+#
+# 子串层（0.4~0.657）刻意不算：它是为检索的召回服务的，而且双向对称——
+# `共阴` 与 `共阴绿红` 会互相子串命中，于是「新元件更宽泛」被算成「等价」，
+# 方向还会翻。检索要召回，包含要精确，两者共用分层内核但不能共用门槛。
+_CONTAINMENT_MIN = 0.9
+
+# 关系 → 展示措辞。只在这里出现一次：命令行的报错正文和交互模式的追问
+# 上下文共用它，同一条规则不允许有两种说法。
+_CONTAINMENT_LABEL = {
+    "same": "等价",
+    "subset": "新元件更宽泛",
+    "superset": "新元件更具体",
+}
+
+
+def _tag_covered(tag, sup_tags):
+    """sup_tags 里是否有一条能代表 tag → (是否, 分数, 依据)。
+
+    字面相同要先单独判一遍，不走分层：裸前缀是没有维度的（parse_quantity('3p')
+    得到的 dim 是 None），而当 sup_tags 里没有类型标签、给不出 hint 时，
+    两条一模一样的 `3p` 只能拿到 0.70，被门槛挡在门外——`排母 3p 2.54`
+    录重的那一对正是这么漏掉的。
+
+    依据只保留非字面命中（`10k ≈ 10kΩ`、`瓷片 → MLCC`）：字面相同不需要解释。
+    """
+    nt = normalize_text(tag)
+    for s in sup_tags:
+        if normalize_text(s) == nt:
+            return True, 1.0, ""
+    score, reason = _match_tags(nt, sup_tags)
+    if score >= _CONTAINMENT_MIN:
+        return True, score, reason or ""
+    return False, score, ""
+
+
+def _covered(sub_tags, sup_tags):
+    """sub_tags 是否整体被 sup_tags 覆盖 → (是否, 最弱一环的依据)。"""
+    if not sub_tags:
+        return False, ""
+    weakest = (2.0, "")
+    for t in sub_tags:
+        ok, score, why = _tag_covered(t, sup_tags)
+        if not ok:
+            return False, ""
+        if why and score < weakest[0]:
+            weakest = (score, why)
+    return True, weakest[1]
+
+
+def find_containment(components, tags):
+    """新标签与库中元件的包含关系 → [(元件, 关系, 依据)]，按序号排序。
+
+    关系是 "same" / "subset" / "superset"，主语一律是**新元件**：subset 表示
+    新标签集合是已有元件的子集（信息更少、更宽泛），superset 则相反。
+
+    判定与检索共用同一套分层内核（_match_tags），但两条都刻意不走：句柄层
+    （`#7` 在这里是一条字面标签，不该去命中序号；`0805` 这类封装码本身是合法
+    十六进制串，会平白去撞 id 前缀）和复合词展开层（一个标签 `贴片电容` 会被
+    展开成 `[贴片, C]`，把「元件里有这个标签」偷换成「元件里同时有 贴片 和 C」）。
+
+    tags 为空必须显式挡掉：空集合的 all() 为真，会命中库里一切。
+    """
+    if not tags:
+        return []
+    out = []
+    for c in components:
+        new_in_c, why_fwd = _covered(tags, c.tags)
+        c_in_new, why_rev = _covered(c.tags, tags)
+        if new_in_c and c_in_new:
+            # 这是「等价意义下的相等」，不是逐字相等：归约层会把 10k 与 10kΩ
+            # 判成同一条。措辞上不能宣称「完全重复」，否则用户看到两条不一样
+            # 的标签被叫做重复，就再也不信这个提示了。
+            out.append((c, "same", why_fwd or why_rev))
+        elif new_in_c:
+            out.append((c, "subset", why_fwd))
+        elif c_in_new:
+            out.append((c, "superset", why_rev))
+    # 按序号排：文件顺序可以被手工编辑 JSON 打乱，序号不会。
+    out.sort(key=lambda r: r[0].seq)
+    return out
 
 
 # =============================================================================
@@ -2162,6 +2255,28 @@ def render_components(components, title=None):
     print(f"\n共 {len(components)} 条")
 
 
+def render_containment(relations, tags):
+    """「新元件与已有元件存在包含关系」的说明块，返回多行文本（不打印）。
+
+    命令行把它当 AppError 的消息，交互模式逐行 sub_print 之后再追问——同一条
+    规则不允许有两种说法，所以整块渲染只有这一份。这里刻意不加缩进参数：
+    命令行要的是「标题顶格、表格缩进两格」（与 _require_single 同款），
+    交互模式在它之上再整体 +2，两种排版都从这一份文本派生。
+    """
+    lines = [f"新元件 {format_tag_line(tags)} 与库中 {len(relations)} 个元件存在包含关系："]
+    rows = [
+        ((f"[{i}]", f"#{c.seq}"), tuple(c.tags),
+         (_CONTAINMENT_LABEL[kind], f"存量: {c.stock.label()}"))
+        for i, (c, kind, _why) in enumerate(relations, 1)
+    ]
+    lines.extend(format_slot_table(rows, indent="  "))
+    # 依据行只在有非字面命中时出现。字面相同的重复录入，标签本身就是解释。
+    for c, _kind, why in relations:
+        if why:
+            lines.append(f"  #{c.seq}：{why}")
+    return "\n".join(lines)
+
+
 def component_to_json(c, score=None, per_token=None):
     d = {"seq": c.seq, "id": c.id, "tags": list(c.tags), "stock": c.stock.to_dict()}
     if score is not None:
@@ -2257,6 +2372,8 @@ def build_parser():
     pa.add_argument("tags", nargs="+", help="标签，例如 C 0805 贴片 100nF 50V")
     _add_stock_options(pa)
     pa.add_argument("--note", default="", help="备注")
+    pa.add_argument("--force", action="store_true",
+                    help="与库中元件存在包含关系时仍然添加，不报错退出")
 
     pst = sub.add_parser("stock", parents=[sub_common], help="更改存量")
     pst.add_argument("target", nargs="+", help="元件定位，如 #7 或 51R")
@@ -2352,11 +2469,18 @@ def cmd_search(args, path):
     return EXIT_OK if hits else EXIT_NOTFOUND
 
 
-def cmd_add(args, path, extra_package=None):
+def cmd_add(args, path, extra_package=None, confirm=None):
     """添加元件。
 
     extra_package 只由交互模式传入（见 classify_tags）：命令行入口不传，
     于是封装只能靠查表识别，认不出就报错。
+
+    confirm 是第二个只由交互模式传入的通道：命中包含关系时由它决定加不加，
+    返回 True 继续、False 取消。命令行不传（None），改为直接报错退出。
+
+    检测放在本函数而不是 WarehouseKeeper，一是两个入口只能有一份判定和一份
+    措辞，二是包含判定必须看到 classify_tags 定稿后的标签——`add 0805 100nF
+    50V` 补出来的那个 C 要是赶不上，跟库里任何一条电容都比不出关系来。
     """
     inv = load_inventory(path)
     tags = []
@@ -2399,6 +2523,20 @@ def cmd_add(args, path, extra_package=None):
         tags = [t for t in tags if t not in plan.absorbed]
 
     stock = tag_stock if tag_stock is not None else make_stock(args, default_coarse=True)
+
+    # 包含检查必须排在存盘之前：命令行报错、交互模式取消，两种拒绝都不能落盘。
+    # 用的也是定稿后的 tags——类型补过、冗余删过，才对得上真正要写进去的东西。
+    # force 只在这一个地方读，两个入口不必各自分叉。
+    relations = find_containment(inv.components, tags)
+    if relations and not getattr(args, "force", False):
+        if confirm is None:
+            raise AppError(
+                render_containment(relations, tags)
+                + "\n\n（未写入。确认不是重复录入的话，加 --force 再执行一次。）",
+                EXIT_USAGE)
+        if not confirm(relations, tags):
+            return EXIT_OK
+
     comp = Component(
         id=str(uuid.uuid4()),
         seq=inv.next_seq,
@@ -2430,12 +2568,12 @@ def cmd_add(args, path, extra_package=None):
         print("提示：未指定存量，已设为 0（无）。用 --level 0-4 / --qty N，"
               "或在标签里写 多 / 很少 / qty23（英文 none / few / some / many / lots 同样认）。")
 
-    # 防重复录入提示。不阻断——同一批电容分两袋放是合法的。
-    others = [c for c in inv.components if c.seq != comp.seq]
-    similar = search_components(others, comp.tags)
-    if similar and similar[0].score >= 0.9:
-        c = similar[0].component
-        print(f"注意：库中已有相似的 #{c.seq}  {format_tag_line(c.tags)}（匹配度 {similar[0].score:.2f}）")
+    # --force 的意思是「我看过了，照加」，但命令行那条路上用户可能一上来就带着
+    # 它，从没见过相关元件是谁。留一行痕迹。交互模式不重复打印：它刚把同一张
+    # 表摊开问过，再说一遍是噪音。
+    if relations and confirm is None:
+        seqs = "、".join(f"#{c.seq}" for c, _k, _w in relations)
+        print(f"注意：与库中 {seqs} 存在包含关系（已按 --force 写入）。")
     return EXIT_OK
 
 
@@ -2786,6 +2924,54 @@ def run_selftest():
     # 吸收：`2.54` 派生出的安装方式就是直插，和 add C 直插 5x11 100uF 一个行为。
     _tags, _ = resolve_package_answer(["led", "共阴绿红"], "直插 2.54")
     eq(classify_tags(_tags).absorbed, ("直插",), "多词回答里的直插仍会被封装吸收")
+
+    # --- 包含判定：重复录入该不该拦 ---
+    #
+    # 判定复用检索的分层内核，但门槛取 0.9、另加一条字面相同的快速通道。这两个
+    # 取舍各有一个真实反例钉着，理由见 _CONTAINMENT_MIN 与 _tag_covered 的注释。
+    _cap = Component(id="cccccccc-1111-2222-3333-444444444444", seq=1,
+                     tags=["C", "100nF", "50V", "MLCC", "0805"],
+                     stock=Stock("coarse", level=3))
+
+    def _contain_kinds(comps, ts):
+        return [(kind, c.seq) for (c, kind, _w) in find_containment(comps, ts)]
+
+    eq(_contain_kinds([_cap], ["C", "0805", "100nF", "50V", "MLCC"]), [("same", 1)],
+       "标签乱序的同义写法算等价——判定与列序无关")
+    eq(_contain_kinds([_cap], ["C", "0805", "0.1uF", "50V", "MLCC"]), [("same", 1)],
+       "0.1uF 与 100nF 在包含判定里必须等价")
+    eq(_contain_kinds([_cap], ["C", "0805", "100nF"]), [("subset", 1)],
+       "新元件信息更少，是已有元件的子集")
+    eq(_contain_kinds([_cap], ["C", "0805", "100nF", "50V", "MLCC", "1%"]), [("superset", 1)],
+       "新元件更具体，反过来是超集")
+    eq(_contain_kinds([_cap], ["R", "0805", "10k"]), [], "无关元件不产生关系")
+    eq(find_containment([_cap], []), [],
+       "空标签集合必须显式挡掉：all([]) 为真，会命中库里一切")
+
+    _tenk = Component(id="dddddddd-1111-2222-3333-444444444444", seq=2,
+                      tags=["R", "10kΩ", "0805"], stock=Stock("coarse", level=0))
+    eq(_contain_kinds([_tenk], ["R", "10k", "0805"]), [("same", 2)], "10k 与 10kΩ 必须等价")
+
+    # 裸前缀是没有维度的（parse_quantity('3p') 得到的 dim 是 None），库里又没有
+    # 类型标签给得出 hint，两条一模一样的 3p 在分层里只能拿 0.70，会被门槛挡在
+    # 门外。字面相同的快速通道就是为这条存在的——它是用户真录重过的那一对。
+    _hdr = Component(id="eeeeeeee-1111-2222-3333-444444444444", seq=3,
+                     tags=["排母", "3p", "2.54"], stock=Stock("coarse", level=3))
+    eq(_contain_kinds([_hdr], ["排母", "3p", "2.54"]), [("same", 3)],
+       "裸前缀的量拿不到高分，字面相同必须直接算同一条")
+    eq(_contain_kinds([_hdr], ["排母", "3p"]), [("subset", 3)], "少一个封装的排母更宽泛")
+
+    # 子串层双向对称，必须整体排除，否则前缀型真子集会被判成「等价」、方向还翻。
+    _led = Component(id="ffffffff-1111-2222-3333-444444444444", seq=4,
+                     tags=["led", "2.54", "共阴绿红"], stock=Stock("coarse", level=0))
+    ok(all(kind != "same" for (kind, _s) in _contain_kinds([_led], ["led", "2.54", "共阴"])),
+       "共阴 子串命中 共阴绿红、反向也中，绝不能因此报成等价")
+
+    _clines = render_containment(find_containment([_hdr], ["排母", "3p", "2.54"]),
+                                 ["排母", "3p", "2.54"]).splitlines()
+    ok(_clines[0] == "新元件 排母 3p 2.54 与库中 1 个元件存在包含关系：",
+       "说明块首行顶格，命令行和交互模式各自在它之上加自己的前缀")
+    ok("等价" in _clines[1] and "#3" in _clines[1], "表格里要同时给出序号和关系")
 
     # --- argv 重写 ---
     eq(normalize_argv(["--search", "51R"]), ["search", "51R"], "--search 应被重写")
