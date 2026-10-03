@@ -33,7 +33,9 @@ from inventory import (
     EXIT_OK,
     EXIT_USAGE,
     PACKAGE_PROMPT,
+    PACKAGE_QUESTION,
     STOCK_PROMPT,
+    STOCK_QUESTION,
     Stock,
     canon_package,
     classify_tags,
@@ -208,6 +210,35 @@ def check_stock_opts(opts):
 
 
 # =============================================================================
+# 追问层
+# =============================================================================
+
+# 追问的缩进。
+#
+# 一条命令执行期间，程序第二次向用户要输入时，那个输入点和它的上下文一起缩进两格，
+# 视觉上挂在命令下方。缩进覆盖「还在等你回答」的那一段：
+#
+#   问句（长问句单独占一行）→ 重问的提示 → 输入点
+#
+# 问题一有答案，缩进就结束——「已添加 #3 …」「已取消。」这类结果行回到第一列。
+# 于是「顶格的都是结果、缩进的都是在等你」这条规则不用记，扫一眼就能看出来。
+#
+# 宽度取 2，和 render_candidates 的候选列表、do_remove 的详情行对齐：追问的输入点
+# 正好落在它上面那组候选/详情下面缩进同一级，读起来是同一个块。
+SUB_INDENT = "  "
+
+
+def sub_ask(prompt):
+    """追问的输入点。缩进由这里统一加，调用点不再自己拼空格。"""
+    return input(SUB_INDENT + prompt)
+
+
+def sub_print(text):
+    """追问块里的一行输出：问句、重问的提示、非法输入的抱怨。"""
+    print(SUB_INDENT + text)
+
+
+# =============================================================================
 # 定位层
 # =============================================================================
 
@@ -251,7 +282,7 @@ def pick_one(inv, words, verb):
 
     while True:
         try:
-            ans = input(f"选择 [1-{len(shown)}] / #序号 / 回车取消 > ").strip()
+            ans = sub_ask(f"选择 [1-{len(shown)}] / #序号 / 回车取消 > ").strip()
         except (EOFError, KeyboardInterrupt):
             # 必须在这里自己捕获。让它冒泡到主循环的话，一次 Ctrl+C 会变成
             # 「退出整个程序」而不是「取消这次选择」。
@@ -269,24 +300,24 @@ def pick_one(inv, words, verb):
             hit = next((c for c in found if c.seq == seq), None)
             if hit is not None:
                 return hit
-            print(f"本次匹配里没有 #{seq} 的元件。")
+            sub_print(f"本次匹配里没有 #{seq} 的元件。")
             continue
 
         if ans.isdigit():
             i = int(ans)
             if 1 <= i <= len(shown):
                 return shown[i - 1]
-            print(f"请输入 1-{len(shown)} 之间的数字，或回车取消。")
+            sub_print(f"请输入 1-{len(shown)} 之间的数字，或回车取消。")
             continue
 
         # 非法输入只重新问，不取消——手指打滑不该让人把整条命令重敲一遍。
-        print("无法识别，请输入列表编号、#序号，或回车取消。")
+        sub_print("无法识别，请输入列表编号、#序号，或回车取消。")
 
 
 def confirm(prompt):
     """是非确认。回车、EOF、Ctrl+C 都视为「否」。"""
     try:
-        ans = input(prompt).strip().lower()
+        ans = sub_ask(prompt).strip().lower()
     except (EOFError, KeyboardInterrupt):
         print()
         return False
@@ -348,14 +379,17 @@ def ensure_package(tags):
     if plan.package is not None:
         return tags, None
 
+    # 问句只打一次，重问时只重出输入点：那句话 80 列宽，答错一次就再糊一整行更难读，
+    # 而它要说的（封装有哪些写法）不会因为上一次答错而变。重问时旁边那句提示足够提醒。
+    sub_print(PACKAGE_QUESTION)
     while True:
         try:
-            ans = input(PACKAGE_PROMPT).strip()
+            ans = sub_ask(PACKAGE_PROMPT).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n已取消。")
             return None, None
         if not ans:
-            print("封装不能为空。确实没有封装的话，输入 NO PACKAGE。")
+            sub_print("封装不能为空。确实没有封装的话，输入 NO PACKAGE。")
             continue
         canon = canon_package(ans)
         if canon is not None:
@@ -379,9 +413,11 @@ def ensure_stock(tags, opts):
     if any(k in _TYPE_PROBLEMS for k, _ in classify_tags(tags).issues):
         return None, False
 
+    # 同 ensure_package：问句只打一次，重问只重出输入点。
+    sub_print(STOCK_QUESTION)
     while True:
         try:
-            ans = input(STOCK_PROMPT).strip()
+            ans = sub_ask(STOCK_PROMPT).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n已取消。")
             return None, True
@@ -390,12 +426,12 @@ def ensure_stock(tags, opts):
             return None, False
         _, stock, issues = extract_stock_tags([ans])
         if issues:
-            print(issues[0][1])
+            sub_print(issues[0][1])
             continue
         if stock is None:
-            print("看不懂。请写 qty23（23 个）、level2（等级），"
-                  "或 无 / 极少 / 少 / 多 / 极多。"
-                  "英文 none / few / some / many / lots 也可以。回车跳过。")
+            sub_print("看不懂。请写 qty23（23 个）、level2（等级），"
+                      "或 无 / 极少 / 少 / 多 / 极多。"
+                      "英文 none / few / some / many / lots 也可以。回车跳过。")
             continue
         return ans, False
 
@@ -512,11 +548,14 @@ def do_remove(rest, path):
 
     # 无条件二次确认，即便用户输入的是明确的 #7——#序号 保证的是定位无歧义，
     # 不是意图无误。把完整信息摊开，让用户在按 y 之前看到的和他将删掉的是同一个东西。
-    print("即将删除：")
-    print(f"  #{comp.seq}  {' '.join(comp.tags)}   存量: {comp.stock.label()}")
+    #
+    # 这一整块缩进：它是「确认删除？」这个问题的上下文，和那个输入点属于同一段。
+    # 详情行在字符串里已经自带两格，加上追问的一级正好比它再深一级。
+    sub_print("即将删除：")
+    sub_print(f"  #{comp.seq}  {' '.join(comp.tags)}   存量: {comp.stock.label()}")
     if comp.note:
-        print(f"  备注: {comp.note}")
-    print(f"（上一版数据在 {Path(path).name}.bak，可以从那里恢复这次删除）")
+        sub_print(f"  备注: {comp.note}")
+    sub_print(f"（上一版数据在 {Path(path).name}.bak，可以从那里恢复这次删除）")
     if not confirm("确认删除？(y/N) > "):
         print("已取消。")
         return EXIT_OK
