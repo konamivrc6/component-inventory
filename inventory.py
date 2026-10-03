@@ -407,6 +407,10 @@ STOCK_PROMPT = "数量 > "
 # 不带前缀的裸数字刻意不接受：粗略存量本来就是 0-4，`3` 到底是「多」还是
 # 「3 个」说不清，与其靠数值范围猜，不如要求写清楚。
 #
+# 这条只管**标签位置**。stock 命令的值位置只有一个 token，`3` 在那里没有第二
+# 种解释，所以 `stock #7 3` 是精确 3 个——值位置的那套写法在 parse_stock_value
+# 里，两处不能合并，理由见那个函数。
+#
 # 负号也进正则，好让 `qty-3` 走到「不能为负」的报错，而不是静默当成普通标签存进去。
 STOCK_TAG_RE = re.compile(r"^(qty|level)(-?\d+)$", re.IGNORECASE)
 
@@ -1848,6 +1852,10 @@ def extract_stock_tags(tags):
     依赖数据层。不抛异常、把问题作为数据返回，与 classify_tags 同风格，
     便于自检直接断言。
 
+    这里是**标签位置**的写法。stock 命令的值位置还认裸数字与相对增减
+    （`stock #7 3`、`stock #7 +5`），那两笔刻意留在这里之外——理由见
+    parse_stock_value。两处别为了「统一」而合并。
+
     匹配是整个标签的精确比对，不是子串——所以 `多圈电位器` 不会被误摘，
     `无封装`（封装的哨兵）也不会被当成存量的 `无`。比对大小写不敏感
     （`NONE` / `Level2` 都认），但这只作用于英文与前缀写法，仍然是整标签
@@ -1864,11 +1872,11 @@ def extract_stock_tags(tags):
             kind, num = m.group(1).lower(), int(m.group(2))
             if kind == "qty":
                 if num < 0:
-                    err = f"存量标签 `{tag}` 的个数不能是负数"
+                    err = f"存量写法 `{tag}` 的个数不能是负数"
                 else:
                     cand = Stock("accurate", count=num)
             elif not 0 <= num <= 4:
-                err = f"存量标签 `{tag}` 的等级应该在 0-4 之间"
+                err = f"存量写法 `{tag}` 的等级应该在 0-4 之间"
             else:
                 cand = Stock("coarse", level=num)
         else:
@@ -2260,8 +2268,8 @@ def render_containment(relations, tags):
 
     命令行把它当 AppError 的消息，交互模式逐行 sub_print 之后再追问——同一条
     规则不允许有两种说法，所以整块渲染只有这一份。这里刻意不加缩进参数：
-    命令行要的是「标题顶格、表格缩进两格」（与 _require_single 同款），
-    交互模式在它之上再整体 +2，两种排版都从这一份文本派生。
+    命令行要的是「标题顶格、表格缩进两格」，交互模式在它之上再整体 +2，
+    两种排版都从这一份文本派生。
     """
     lines = [f"新元件 {format_tag_line(tags)} 与库中 {len(relations)} 个元件存在包含关系："]
     rows = [
@@ -2376,8 +2384,16 @@ def build_parser():
                     help="与库中元件存在包含关系时仍然添加，不报错退出")
 
     pst = sub.add_parser("stock", parents=[sub_common], help="更改存量")
-    pst.add_argument("target", nargs="+", help="元件定位，如 #7 或 51R")
-    _add_stock_options(pst, required=True)
+    # target 与 value 都是单值：目标只认 `#编号`，值是一个 token。
+    #
+    # 值里的 `-5` / `-` 能落到位置参数上，靠的是 argparse 的一条隐含前提——
+    # 本 parser 没有任何短选项长得像负数，`_negative_number_matcher` 才会把
+    # `-5` 让给位置参数（`-` 更是因为长度为 1 直接被放过）。将来若给这里加
+    # `-1` 这类短选项，`stock #7 -5` 会被重新解释成选项，相对增减当场失效。
+    pst.add_argument("target", help="元件编号，只写 #编号，如 #7")
+    pst.add_argument("value", nargs="?",
+                     help="新存量：档位词（多 / plenty）/ level3 / qty23 / 23 / +5 / -2 / 加5 / 用5 / add5")
+    _add_stock_options(pst)
 
     pl = sub.add_parser("list", parents=[sub_common], help="列出全部元件")
     pl.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条")
@@ -2388,12 +2404,22 @@ def build_parser():
     psh.add_argument("target", nargs="+", help="元件定位，如 #7 或 51R")
 
     pr = sub.add_parser("remove", parents=[sub_common], help="删除元件")
-    pr.add_argument("target", nargs="+", help="元件定位，如 #7 或 51R")
+    pr.add_argument("target", help="元件编号，只写 #编号，如 #7")
 
     return p
 
 
 def make_stock(args, default_coarse=False):
+    """从 --level / --qty 造一个 Stock。选项形态的唯一入口。
+
+    范围校验收在这里而不是各调用点：argparse 的 choices 只管命令行，REPL 那边
+    原来自带一份 check_stock_opts，两处各挡各的——绕过任何一处就能把非法的
+    level 写进盘，要等下一次 Stock.from_dict 才报错。收拢之后 CLI 与 REPL 共用
+    同一份判定和同一份措辞。
+
+    两个都给时仍然由 qty 静默胜出：命令行靠 argparse 的互斥组挡住，REPL 的
+    do_add 自带一段检查，两处都还在。这是既有行为，本次不动 add 那一路。
+    """
     qty = getattr(args, "qty", None)
     level = getattr(args, "level", None)
     if qty is not None:
@@ -2401,10 +2427,102 @@ def make_stock(args, default_coarse=False):
             raise AppError("--qty 不能为负数", EXIT_USAGE)
         return Stock("accurate", count=qty)
     if level is not None:
+        if not 0 <= level <= 4:
+            raise AppError(f"--level 应该在 0-4 之间，实际是 {level}", EXIT_USAGE)
         return Stock("coarse", level=level)
     if default_coarse:
         return Stock("coarse", level=0)
     raise AppError("必须指定 --level 或 --qty", EXIT_USAGE)
+
+
+# 值位置独有的相对增减写法：`+N` / `-N` / `加N` / `用N` / `add5`，数字省略就是
+# 1，中文动词后面可以多一个「掉」（`用掉5` ≡ `用5`）。
+#
+# 只有这里认。标签路径（extract_stock_tags）刻意不认裸数字与增减号，因为标签
+# 是按空格分词的，`0805`、`1000` 这类封装码满屏都是，认了就会把它们吃成个数；
+# 值位置只有一个 token，没有这个风险。
+#
+# 多 / 少 / low 刻意不进这张表：它们已经是存量词（粗略 3 / 2 / 2）。同一个词在
+# 同一个位置有两种解释是最坏的一种歧义，比少一个写法糟得多——`多5` 落到「看不懂」
+# 的报错里，报错文案会点明它们是档位词。
+#
+# 到 / 满 / 空 也不收：语义双关，「到5」既可能是「到货 5 个」也可能是「达到 5」，
+# 后者是设值不是增减。英文的 up / down / in / out 同理太短，方向靠猜。
+_DELTA_RE = re.compile(
+    r"^(?:(?P<sign>[+-])"
+    r"|(?P<up>加|增|添|补|进|入|add|plus|inc|gain)"
+    r"|(?P<down>减|用|耗|去|出|丢|损|坏|sub|minus|dec|use|take|lost))"
+    r"掉?(?P<num>\d*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_stock_value(token):
+    """解析 stock 值位置上的一个 token → ("set", Stock) 或 ("delta", 增量)。
+
+    绝对写法整段委托给 extract_stock_tags——档位词与 levelN / qtyN 只有那一份
+    实现，这里不再抄一遍。裸数字与增减词是值位置独有、标签路径刻意不认的写法
+    （理由见 _DELTA_RE 上面），所以只在本函数里补。
+
+    不认就直接报错，不返回 None：值位置没有「这也许是个别的什么」的余地。
+    """
+    raw = normalize_text(token)
+    if not raw:
+        raise AppError("stock 的值不能是空的。", EXIT_USAGE)
+
+    m = _DELTA_RE.match(raw)
+    if m:
+        num = int(m.group("num")) if m.group("num") else 1
+        if m.group("sign"):
+            return "delta", -num if m.group("sign") == "-" else num
+        return "delta", -num if m.group("down") else num
+
+    if raw.isdigit():
+        return "set", Stock("accurate", count=int(raw))
+
+    _rest, stock, issues = extract_stock_tags([raw])
+    if issues:
+        raise AppError(issues[0][1], EXIT_USAGE)
+    if stock is not None:
+        return "set", stock
+
+    raise AppError(
+        f"看不懂存量写法 `{token}`。可以写：\n"
+        f"  档位词  无 / 极少 / 少 / 多 / 极多（英文 none/few/some/many/lots 等，整套都认）\n"
+        f"  带前缀  level0-4（档位）/ qty23（精确 23 个）\n"
+        f"  裸数字  23 —— 精确 23 个\n"
+        f"  进 / 出  +5 / -5 / 加5 / 加掉5 / 用5 / add5 / sub5，省略数字就是 1\n"
+        f"（多 / 少 / low 是档位词，不是增减词）",
+        EXIT_USAGE,
+    )
+
+
+def apply_stock_value(current, token, seq):
+    """把值 token 作用到当前存量上，返回新的 Stock。seq 只用来写报错里的例子。
+
+    相对增减只在当前是「精确」时有意义——粗略档位没有可比的数量基准，替用户
+    猜一个基准不如要求他先写成精确数。新加的元件默认是粗略的「无(0)」，所以
+    刚 add 完就想 `+1` 的人一定会撞上这条，报错必须把下一步写清楚。
+    """
+    kind, payload = parse_stock_value(token)
+    if kind == "set":
+        return payload
+
+    if current.mode != "accurate":
+        raise AppError(
+            f"当前存量是「{current.label()}」，粗略档位没法做相对增减。\n"
+            f"先写成精确数（例如 `stock #{seq} 20`）再用 `+N` / `-N`，"
+            f"或者直接用档位词覆盖（例如 `stock #{seq} 少`）。",
+            EXIT_USAGE,
+        )
+    new = current.count + payload
+    if new < 0:
+        raise AppError(
+            f"`{token}` 会让存量从 {current.count} 变成 {new}，不能为负。\n"
+            f"要清零就写 `stock #{seq} 0`。",
+            EXIT_USAGE,
+        )
+    return Stock("accurate", count=new)
 
 
 def resolve_target(inv, words):
@@ -2428,22 +2546,41 @@ def resolve_target(inv, words):
     return [h.component for h in search_components(inv.components, tokens)]
 
 
-def _require_single(inv, words, verb):
-    """定位到唯一一个元件，否则抛错。多命中时绝不自动选第一个。"""
-    found = resolve_target(inv, words)
-    target_desc = " ".join(words)
+# 改库存与删元件的目标只能是一个 `#编号`。
+#
+# 曾经这里是三层解析（编号 → id 前缀 → 完整检索）。收窄到编号，是因为这两个
+# 命令都得先定位到**一条**记录再动手：三层解析会给出多个候选，于是命令行报了错
+# 还要再列一张候选表、交互模式还要再让用户挑一次，同一条挑选规则写两遍。
+# 编号是永久的、每个命令的输出里都有；要按标签找元件，第一步本来就该是 search。
+#
+# 不认裸数字：编号在本项目里始终写作 `#7`，多一种写法就多一条要解释的规则。
+#
+# resolve_target 与 find_by_id_prefix 留着给 cmd_show 用——show 下个版本整个
+# 删掉，那时一并清。
+_HANDLE_RE = re.compile(r"^#(\d+)$")
+
+
+def parse_handle(text):
+    """把目标文本解析成序号。只认 `#编号`，其余一律报错。"""
+    m = _HANDLE_RE.match(normalize_text(text))
+    if not m:
+        raise AppError(
+            f"目标只能写成 #编号（如 #7），实际是 {text!r}。\n"
+            f"编号是永久的：先用 `search 关键词` 或 `list` 查到它。",
+            EXIT_USAGE,
+        )
+    return int(m.group(1))
+
+
+def _require_handle(inv, text, verb):
+    """定位到 `#编号` 指的那一个元件，否则抛错。"""
+    seq = parse_handle(text)
+    found = inv.find_by_seq(seq)
     if not found:
-        raise AppError(f"没有匹配的元件：{target_desc}", EXIT_NOTFOUND)
-    if len(found) > 1:
-        lines = [f"匹配到 {len(found)} 个元件，无法确定要{verb}哪一个。请收窄条件或改用 #序号："]
-        rows = [
-            ((f"[{i}]", f"#{c.seq}"), tuple(c.tags), (f"存量: {c.stock.label()}",))
-            for i, c in enumerate(found[:20], 1)
-        ]
-        lines.extend(format_slot_table(rows, indent="  "))
-        if len(found) > 20:
-            lines.append(f"  …… 还有 {len(found) - 20} 个")
-        raise AppError("\n".join(lines), EXIT_USAGE)
+        raise AppError(
+            f"没有 #{seq} 这个编号，没法{verb}。用 `list` 看全部元件的编号。",
+            EXIT_NOTFOUND,
+        )
     return found[0]
 
 
@@ -2579,9 +2716,26 @@ def cmd_add(args, path, extra_package=None, confirm=None):
 
 def cmd_stock(args, path):
     inv = load_inventory(path)
-    comp = _require_single(inv, args.target, "修改")
+    comp = _require_handle(inv, args.target, "修改")
+
+    # 三个来源只能给一个，缺一个都不行。逐条查而不是用互斥组，是因为值这条路
+    # 走位置参数，argparse 那个 group 管不到它。
+    value = getattr(args, "value", None)
+    level = getattr(args, "level", None)
+    qty = getattr(args, "qty", None)
+    if sum(x is not None for x in (value, level, qty)) > 1:
+        raise AppError("新存量给多了：值、--level、--qty 只能给一个。", EXIT_USAGE)
+    if value is None and level is None and qty is None:
+        raise AppError(
+            "stock 需要给出新存量，例如：stock #7 plenty / stock #7 23 / "
+            "stock #7 +1，或 stock #7 --level 2 / stock #7 --qty 100。",
+            EXIT_USAGE,
+        )
+
     old = comp.stock.label()
-    comp.stock = make_stock(args)
+    # 选项形态复用 make_stock：--qty 负数、--level 越界只有那一份措辞。
+    comp.stock = (apply_stock_value(comp.stock, value, comp.seq) if value is not None
+                  else make_stock(args))
     comp.updated_at = _now()
     save_inventory(inv)
     print(f"#{comp.seq}  {format_tag_line(comp.tags)}   存量: {old} → {comp.stock.label()}")
@@ -2623,9 +2777,17 @@ def cmd_show(args, path):
     return EXIT_OK
 
 
-def cmd_remove(args, path):
+def cmd_remove(args, path, confirm=None):
+    """删除元件。
+
+    confirm 只由交互模式传入，与 cmd_add 的 confirm 同一个套路：命令行不传，
+    删之前不再问；交互模式传入一个回调，由它把详情摊开再确认。删除本身与
+    「next_seq 不回收」的理由因此只有一份，不再被 REPL 抄第二遍。
+    """
     inv = load_inventory(path)
-    comp = _require_single(inv, args.target, "删除")
+    comp = _require_handle(inv, args.target, "删除")
+    if confirm is not None and not confirm(comp, path):
+        return EXIT_OK
     inv.components.remove(comp)
     # next_seq 不回收：删除后 #7 不会再被分配给新元件，
     # 否则用户记下的 #7 会悄悄指向另一个东西。
@@ -3364,6 +3526,114 @@ def run_selftest():
     _rest, _s, _ = extract_stock_tags(["C", "0805", "100nF", "lots"])
     ok(_s is not None, "lots 应被摘成存量")
     eq(tuple(_rest), ("C", "0805", "100nF"), "英文等级词也不该算进参数")
+
+    # --- stock 命令的值语法 ---
+    #
+    # 值位置与标签位置是两套写法，这里把差别钉死：档位词与 levelN/qtyN 两边共用，
+    # 裸数字与增减词只在值位置认。改动任何一边都要过这组断言。
+
+    def _raises(fn, label):
+        """断言 fn 抛 AppError，返回那条错误好顺带查退出码。"""
+        checks[0] += 1
+        try:
+            fn()
+        except AppError as e:
+            return e
+        failures.append(f"{label}：应当报错，实际通过了")
+        return None
+
+    # 词表整张都认——「档位词表就不能全收吗」这句就是这条断言。
+    for _w, _lv in STOCK_WORDS.items():
+        eq(parse_stock_value(_w), ("set", Stock("coarse", level=_lv)),
+           f"stock 的值要认 {_w!r}")
+
+    for _raw, _want in (("level0", Stock("coarse", level=0)),
+                        ("Level2", Stock("coarse", level=2)),
+                        ("qty23", Stock("accurate", count=23)),
+                        ("QTY23", Stock("accurate", count=23)),
+                        ("qty0", Stock("accurate", count=0))):
+        eq(parse_stock_value(_raw), ("set", _want), f"stock 的值要认 {_raw!r}")
+
+    # 裸数字就是个数：用户定的「如果只有数字就设成这个数字」。
+    for _raw, _n in (("0", 0), ("23", 23), ("0805", 805)):
+        eq(parse_stock_value(_raw), ("set", Stock("accurate", count=_n)),
+           f"值位置的裸数字 {_raw} 是精确个数")
+
+    # 而同样的裸数字**不能**进标签路径，否则 add C 0805 会变成 805 个。
+    for _raw in ("3", "23", "0805"):
+        ok(extract_stock_tags([_raw])[1] is None,
+           f"裸数字 {_raw} 不是存量标签——标签路径认了它，add C 0805 就成了 805 个")
+
+    # 增减词表：进一组、出一组，中英各半。每种都过三遍——带数字、带「掉」、省略数字。
+    _up_cn = ("加", "增", "添", "补", "进", "入")
+    _down_cn = ("减", "用", "耗", "去", "出", "丢", "损", "坏")
+    for _v in _up_cn:
+        eq(parse_stock_value(_v + "5"), ("delta", 5), f"进：{_v}5")
+        eq(parse_stock_value(_v + "掉5"), ("delta", 5), f"进：{_v}掉5 与 {_v}5 等价")
+        eq(parse_stock_value(_v), ("delta", 1), f"进：{_v} 省略数字就是 1")
+    for _v in _down_cn:
+        eq(parse_stock_value(_v + "5"), ("delta", -5), f"出：{_v}5")
+        eq(parse_stock_value(_v + "掉5"), ("delta", -5), f"出：{_v}掉5")
+        eq(parse_stock_value(_v), ("delta", -1), f"出：{_v} 省略数字就是 1")
+    for _v in ("add", "plus", "inc", "gain"):
+        eq(parse_stock_value(_v + "5"), ("delta", 5), f"进：{_v}5")
+        eq(parse_stock_value(_v), ("delta", 1), f"进：{_v} 省略数字就是 1")
+    for _v in ("sub", "minus", "dec", "use", "take", "lost"):
+        eq(parse_stock_value(_v + "5"), ("delta", -5), f"出：{_v}5")
+        eq(parse_stock_value(_v), ("delta", -1), f"出：{_v} 省略数字就是 1")
+
+    # 符号写法。全角 ＋ 由 normalize_text 归一，英文动词不分大小写。
+    for _raw, _want in (("+5", 5), ("-5", -5), ("+", 1), ("-", -1), ("+0", 0),
+                        ("＋5", 5), ("ADD5", 5), ("Add5", 5), ("用掉5", -5)):
+        eq(parse_stock_value(_raw), ("delta", _want), f"增减写法 {_raw!r}")
+
+    # 歧义护栏：多 / 少 / low 是档位词，不是增减词，加了数字也不认。
+    for _w in ("多", "少", "low"):
+        eq(parse_stock_value(_w)[0], "set", f"{_w} 必须解成档位而不是增减")
+    for _raw in ("多5", "少5", "low5", "挺多的", "够用", "51R", "无封装", "foo", ""):
+        _raises(lambda r=_raw: parse_stock_value(r), f"看不懂的值 {_raw!r}")
+
+    # --- 相对增减只在精确存量上生效 ---
+    _acc42 = Stock("accurate", count=42)
+    eq(apply_stock_value(_acc42, "+3", 7), Stock("accurate", count=45), "精确 42 加 3")
+    eq(apply_stock_value(_acc42, "用掉2", 7), Stock("accurate", count=40), "精确 42 出 2")
+    eq(apply_stock_value(Stock("coarse", level=3), "10", 7),
+       Stock("accurate", count=10), "粗略档可以被精确数覆盖")
+    eq(apply_stock_value(_acc42, "多", 7), Stock("coarse", level=3), "精确档可以被档位词覆盖")
+    for _st, _tok, _label in ((Stock("coarse", level=3), "+1", "粗略档不能相对增减"),
+                              (Stock("coarse", level=0), "-", "粗略档不能相对增减"),
+                              (Stock("accurate", count=0), "-1", "精确 0 不能再减"),
+                              (Stock("accurate", count=2), "减5", "减成负数要报错")):
+        _raises(lambda s=_st, t=_tok: apply_stock_value(s, t, 7), _label)
+
+    # --- 目标只认 #编号 ---
+    for _raw, _want in (("#7", 7), ("#07", 7), ("#123", 123)):
+        eq(parse_handle(_raw), _want, f"编号 {_raw}")
+    for _raw in ("7", "51R", "a1b2c3", "#", "#x", ""):
+        _raises(lambda r=_raw: parse_handle(r), f"目标 {_raw!r} 应当被拒")
+
+    _inv = Inventory("x")
+    _inv.components = [
+        Component(id="11111111-1111-1111-1111-111111111111", seq=3,
+                  tags=["R", "10k", "0805"], stock=Stock("coarse", level=0)),
+        Component(id="22222222-2222-2222-2222-222222222222", seq=9,
+                  tags=["C", "1uF", "0805"], stock=Stock("coarse", level=0)),
+    ]
+    eq(_require_handle(_inv, "#9", "修改").seq, 9, "编号 9 定位")
+    eq(_raises(lambda: _require_handle(_inv, "#99", "修改"), "不存在的编号").code,
+       EXIT_NOTFOUND, "不存在的编号是 NOTFOUND——它和「写法不对」是两回事")
+
+    # --- make_stock 的范围校验 ---
+    eq(make_stock(argparse.Namespace(level=2, qty=None)), Stock("coarse", level=2), "--level 2")
+    eq(make_stock(argparse.Namespace(level=None, qty=5)), Stock("accurate", count=5), "--qty 5")
+    eq(make_stock(argparse.Namespace(level=None, qty=None), default_coarse=True),
+       Stock("coarse", level=0), "add 不给存量时默认「无(0)」")
+    _raises(lambda: make_stock(argparse.Namespace(level=None, qty=None)),
+            "stock 没给存量时不能默默建一个——它和 add 不同")
+    for _ns, _label in ((argparse.Namespace(level=5, qty=None), "--level 5 越界"),
+                        (argparse.Namespace(level=-1, qty=None), "--level 越下界"),
+                        (argparse.Namespace(level=None, qty=-3), "--qty 负数")):
+        _raises(lambda n=_ns: make_stock(n), _label)
 
     # --- 匹配回归：这次改动修的就是这条 ---
     _fixed = Component(id="aaaaaaaa-1111-2222-3333-444444444444", seq=1,

@@ -9,10 +9,14 @@ inventory.py，而这只在「作为脚本运行」时成立。
 分工：
 
   inventory.py          核心层（归一化 / 匹配 / 存储）与命令行层
-  WarehouseKeeper.py    本文件。交互循环、行解析、多命中选择。业务逻辑一律不复制。
+  WarehouseKeeper.py    本文件。交互循环、行解析、追问。业务逻辑一律不复制。
 
-相对命令行的两个增量：一是循环，不必每条命令重新起进程；二是**多命中时列出候选让人挑**，
-而命令行在多命中时直接报错（那是为脚本安全考虑，交互场景下不该迁就它）。
+相对命令行的两个增量：一是循环，不必每条命令重新起进程；二是**追问**——缺封装、
+缺数量、命中包含关系、删除前二次确认，命令行在这些地方要么报错、要么用选项绕过，
+交互场景该问就问。
+
+show 是唯一还吃检索词目标的命令（`show 51R` 命中多条就全列出来）；remove 与
+stock 都只认 `#编号`，和命令行一致。这是暂时的——show 下个版本整个删掉。
 
 明确不做的事：全屏 TUI（当前是 Git Bash 伪终端，msvcrt 与 Windows 控制台 API 都读不到按键）；
 edit 命令（标签写错了 remove 掉重录即可，这是既有决定）。
@@ -36,32 +40,29 @@ from inventory import (
     PACKAGE_QUESTION,
     STOCK_PROMPT,
     STOCK_QUESTION,
-    Stock,
     classify_tags,
     cmd_add,
+    cmd_remove,
     cmd_show,
+    cmd_stock,
     default_data_path,
     extract_stock_tags,
-    format_slot_table,
     format_tag_line,
     load_inventory,
+    make_stock,
     render_components,
     render_containment,
     render_hits,
     resolve_package_answer,
-    resolve_target,
     run_selftest,
-    save_inventory,
     search_components,
     tokenize_query,
-    # 下面两个是 inventory.py 的内部函数（下划线开头），跨模块导入私有名并不漂亮，
-    # 但它们各自承载着必须全项目一致的东西，复制一份等于让两套实现各自演化：
+    # 下面这个 internal 函数（下划线开头）跨模块导入私有名并不漂亮，但它承载着
+    # 必须全项目一致的东西，复制一份等于让两套实现各自演化：
     #   _setup_console_encoding —— 管道和重定向下 stdout 的默认编码是 gbk，而 gbk
     #       编不出 µ (U+00B5)，不处理会抛 UnicodeEncodeError；真控制台则本来就是
     #       utf-8，不该碰。两种情况都归它管，是功能正确性的前提。
-    #   _now —— 时间戳格式，要和 CLI 写出来的记录保持一致。
-    # 改动 inventory.py 时请勿破坏这两个签名。
-    _now,
+    # 改动 inventory.py 时请勿破坏这个签名。
     _setup_console_encoding,
 )
 
@@ -74,8 +75,8 @@ QUIT_WORDS = frozenset({"quit", "exit", ":q", "q"})
 
 # 每个命令认识的选项。值是一个 (namespace 键, 类型) 元组，类型为 None 表示这是个开关。
 #
-# 这些规格必须与 inventory.py 里 build_parser 的子命令定义保持一致——我们复用 cmd_add
-# 和 cmd_show，靠 SimpleNamespace 构造出形状相同的假 args。
+# 这些规格必须与 inventory.py 里 build_parser 的子命令定义保持一致——我们复用
+# cmd_add、cmd_stock、cmd_remove、cmd_show，靠 SimpleNamespace 构造形状相同的假 args。
 ADD_SPEC = {"--level": ("level", int), "--qty": ("qty", int), "--note": ("note", str),
             "--force": ("force", None)}
 STOCK_SPEC = {"--level": ("level", int), "--qty": ("qty", int)}
@@ -93,10 +94,10 @@ HELP_TEXT = """\
 命令
   search 查询词...               检索（多个词之间是「全部命中」）
   add    标签...                 添加元件（缺封装或数量时会问你；类型能推断的会自动补；与已有元件重复时会确认）
-  stock  目标                    更改存量（需要 --level 或 --qty）
+  stock  #编号 [值]              更改存量（值可以直接写：多 / plenty / 23 / +5）
   list                           列出全部（--low 只看存量偏低的）
-  show   目标                    查看详情
-  remove 目标                    删除元件（会二次确认）
+  show   目标                    查看详情（唯一还认检索词定位的命令，命中多个会全部列出）
+  remove #编号                   删除元件（会二次确认）
   help                           显示本帮助
   selftest                       跑一遍 inventory.py 的内置自检
   quit                           退出
@@ -111,13 +112,16 @@ HELP_TEXT = """\
 
 目标怎么写
   #7              永久编号为 7 的元件。编号只增不减，删除后不回收
-  51R / 0.1uF     任意检索词，支持模糊识别：0.1uF ≡ 100nF、51R ≡ 51Ω、电容 ≡ C
-  a1b2c3          id 前缀
-  匹配到多个时会列出候选让你挑，不会像命令行那样直接报错
+  stock / remove  只认 #编号。写检索词会报错，先去 search 查到编号再动手
+  show            还认检索词与 id 前缀（51R / a1b2c3），命中多个就全部列出来
 
-候选列表怎么读
-  [2]  #7  ...    [2] 是本次列表里的位置，#7 是元件的永久编号
-  选择时输入 2 表示列表第 2 项，输入 #7 表示永久编号为 7 的那个元件
+stock 的值怎么写
+  多 / 很少 / plenty      粗略档位，词表整套都认：无 极少 少 多 极多，英文 none few some many lots
+  level2 / qty23          带前缀的写法，分别是档位与精确个数
+  23                      裸数字就是精确 23 个
+  +5 / -3                 在当前的精确存量上增减，裸 + / - 就是加一减一
+  加5 / 用掉2 / add5      同一个意思（进：加增添补进入，出：减用耗去出丢损坏）
+  当前是粗略档位时不能增减，会报错让你先写成精确数
 
 输入技巧
   search "100 nF"        标签里带空格时用引号括起来
@@ -125,6 +129,7 @@ HELP_TEXT = """\
   add R 0603 -- -40~85C  标签以 - 开头且与选项同名时，用 -- 转义
   add C 0805 100nF 多    存量可以直接写在标签里：多 / 很少 / 极少 / qty23
   add C 0805 100nF lots  同上，英文按同一架刻度：none/few/some/many/lots
+  stock #7 多            改存量：档位词、裸数字、增减号都直接接在编号后面
   每行一条命令，不支持跨行
 
 退出
@@ -200,16 +205,13 @@ def split_line(line):
 
 
 def check_stock_opts(opts):
-    """校验 --level / --qty 的取值。
+    """提前校验 --level / --qty，免得用户答完封装与数量才发现选项是错的。
 
-    互斥检查**不在这里**，因为它是各命令自己的事（add 允许两个都不给，stock 不允许）。
+    判定本身不在这里——make_stock 是唯一的实现，这里只是借它提前跑一遍。
+    default_coarse 让「两个都没给」照旧放过：add 允许不给存量，由追问兜底。
     """
-    level = opts.get("level")
-    if level is not None and not (0 <= level <= 4):
-        raise AppError(f"--level 应该在 0-4 之间，实际是 {level}", EXIT_USAGE)
-    qty = opts.get("qty")
-    if qty is not None and qty < 0:
-        raise AppError(f"--qty 不能是负数，实际是 {qty}", EXIT_USAGE)
+    make_stock(SimpleNamespace(level=opts.get("level"), qty=opts.get("qty")),
+               default_coarse=True)
 
 
 # =============================================================================
@@ -226,8 +228,8 @@ def check_stock_opts(opts):
 # 问题一有答案，缩进就结束——「已添加 #3 …」「已取消。」这类结果行回到第一列。
 # 于是「顶格的都是结果、缩进的都是在等你」这条规则不用记，扫一眼就能看出来。
 #
-# 宽度取 2，和 render_candidates 的候选列表、do_remove 的详情行对齐：追问的输入点
-# 正好落在它上面那组候选/详情下面缩进同一级，读起来是同一个块。
+# 宽度取 2，和 do_remove 的详情行、包含关系表格对齐：追问的输入点正好落在它上面
+# 那组详情下面缩进同一级，读起来是同一个块。
 SUB_INDENT = "  "
 
 
@@ -244,77 +246,6 @@ def sub_print(text):
 # =============================================================================
 # 定位层
 # =============================================================================
-
-
-def render_candidates(comps):
-    """渲染候选列表。
-
-    自己写而不用 render_components，是因为后者会把「共 N 条」打成它收到的列表长度，
-    而这里要显示的是「匹配到 M 个，只展示前 20 个」——两个数不一样。
-
-    缩进两格、列间一个空格：它整块挂在「匹配到 M 个元件：」下面，和上面刚打完的
-    那行命令属于同一段，缩进比命令行版本（列间两空格）紧一档。
-    """
-    rows = [
-        ((f"[{i}]", f"#{c.seq}"), tuple(c.tags), (f"存量: {c.stock.label()}",))
-        for i, c in enumerate(comps, 1)
-    ]
-    for line in format_slot_table(rows, indent="  ", gap=" "):
-        print(line)
-
-
-def pick_one(inv, words, verb):
-    """定位到唯一一个元件。多命中时列候选让用户挑，取消则返回 None。
-
-    `[i]` 与 `#seq` 两个编号都会被显示，因为都从 1 开始、含义完全不同：
-    前者是本次列表里的位置（只在本屏有效），后者是元件的永久编号。
-    """
-    found = resolve_target(inv, words)
-    if not found:
-        print(f"没有匹配的元件：{' '.join(words)}")
-        print("提示：用 list 看全部；检索时加 -A 放宽为「任一命中」；或用 #序号 直接定位。")
-        return None
-    if len(found) == 1:
-        return found[0]
-
-    shown = found[:PAGE]
-    print(f"匹配到 {len(found)} 个元件：")
-    render_candidates(shown)
-    if len(found) > PAGE:
-        print(f"（只显示前 {PAGE} 个；可以用 #序号 直接指定，或把条件写得更精确）")
-
-    while True:
-        try:
-            ans = sub_ask(f"选择 [1-{len(shown)}] / #序号 / 回车取消 > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            # 必须在这里自己捕获。让它冒泡到主循环的话，一次 Ctrl+C 会变成
-            # 「退出整个程序」而不是「取消这次选择」。
-            print("\n已取消。")
-            return None
-
-        if ans == "" or ans.lower() == "q":
-            # 回车是取消而不是重新显示列表：改存量、删元件都有副作用，
-            # 默认动作必须是无害的。
-            print("已取消。")
-            return None
-
-        if ans.startswith("#") and ans[1:].isdigit():
-            seq = int(ans[1:])
-            hit = next((c for c in found if c.seq == seq), None)
-            if hit is not None:
-                return hit
-            sub_print(f"本次匹配里没有 #{seq} 的元件。")
-            continue
-
-        if ans.isdigit():
-            i = int(ans)
-            if 1 <= i <= len(shown):
-                return shown[i - 1]
-            sub_print(f"请输入 1-{len(shown)} 之间的数字，或回车取消。")
-            continue
-
-        # 非法输入只重新问，不取消——手指打滑不该让人把整条命令重敲一遍。
-        sub_print("无法识别，请输入列表编号、#序号，或回车取消。")
 
 
 def confirm(prompt):
@@ -503,32 +434,24 @@ def do_add(rest, path):
 
 def do_stock(rest, path):
     opts, words = scan_options(rest, STOCK_SPEC)
-
-    # 校验全部放在 pick_one 之前。否则用户先费劲看完一屏候选、选完，
-    # 才被告知「忘了写 --level」——那是最差的交互顺序。
-    if "level" in opts and "qty" in opts:
-        raise AppError("--level 与 --qty 互斥，只能给一个", EXIT_USAGE)
-    if "level" not in opts and "qty" not in opts:
-        raise AppError("stock 需要 --level 0-4 或 --qty N", EXIT_USAGE)
-    check_stock_opts(opts)
     if not words:
-        raise AppError("stock 需要目标，例如：stock 51R --level 2", EXIT_USAGE)
+        raise AppError("stock 需要 #编号，例如：stock #7 plenty", EXIT_USAGE)
+    if len(words) > 2:
+        raise AppError("stock 最多写两个词：#编号 和值。例如：stock #7 plenty", EXIT_USAGE)
 
-    inv = get_inv(path)
-    comp = pick_one(inv, words, "修改")
-    if comp is None:
-        return EXIT_OK
-
-    old = comp.stock.label()
-    # 整个 stock 对象被替换，而不是改字段——两种模式在结构上就不可能共存。
-    if "qty" in opts:
-        comp.stock = Stock("accurate", count=opts["qty"])
-    else:
-        comp.stock = Stock("coarse", level=opts["level"])
-    comp.updated_at = _now()
-    save_inventory(inv)
-    print(f"#{comp.seq}  {format_tag_line(comp.tags)}   存量: {old} → {comp.stock.label()}")
-    return EXIT_OK
+    # 复用 cmd_stock，这样编号解析、三个来源的互斥、档位词表与相对增减、写盘
+    # 全都是命令行那份实现，不会漂移。SimpleNamespace 的字段形状对应 build_parser
+    # 里 stock 子命令的定义：value 用 getattr 读，字段缺失会静默退化成「没给值」，
+    # 所以它必须在这儿出现。
+    return cmd_stock(
+        SimpleNamespace(
+            target=words[0],
+            value=words[1] if len(words) == 2 else None,
+            level=opts.get("level"),
+            qty=opts.get("qty"),
+        ),
+        path,
+    )
 
 
 def do_list(rest, path):
@@ -560,33 +483,33 @@ def do_show(rest, path):
     return cmd_show(SimpleNamespace(target=rest), path)
 
 
-def do_remove(rest, path):
-    if not rest:
-        raise AppError("remove 需要目标，例如：remove #7", EXIT_USAGE)
+def confirm_remove(comp, path):
+    """把要删的元件摊开，再问一次。
 
-    inv = get_inv(path)
-    comp = pick_one(inv, rest, "删除")
-    if comp is None:
-        return EXIT_OK
+    无条件二次确认，即便用户输入的是明确的 #7——#序号 保证的是定位无歧义，
+    不是意图无误。把完整信息摊开，让用户在按 y 之前看到的和他将删掉的是同一个东西。
 
-    # 无条件二次确认，即便用户输入的是明确的 #7——#序号 保证的是定位无歧义，
-    # 不是意图无误。把完整信息摊开，让用户在按 y 之前看到的和他将删掉的是同一个东西。
-    #
-    # 这一整块缩进：它是「确认删除？」这个问题的上下文，和那个输入点属于同一段。
-    # 详情行在字符串里已经自带两格，加上追问的一级正好比它再深一级。
+    这一整块缩进：它是「确认删除？」这个问题的上下文，和那个输入点属于同一段。
+    详情行在字符串里已经自带两格，加上追问的一级正好比它再深一级。
+    """
     sub_print("即将删除：")
     sub_print(f"  #{comp.seq}  {format_tag_line(comp.tags)}   存量: {comp.stock.label()}")
     if comp.note:
         sub_print(f"  备注: {comp.note}")
     sub_print(f"（上一版数据在 {Path(path).name}.bak，可以从那里恢复这次删除）")
-    if not confirm("确认删除？(y/N) > "):
-        print("已取消。")
-        return EXIT_OK
+    if confirm("确认删除？(y/N) > "):
+        return True
+    # 取消的结果行顶格：追问一有答案，缩进就结束，结果回到第一列。
+    print("已取消。")
+    return False
 
-    inv.components.remove(comp)
-    save_inventory(inv)
-    print(f"已删除 #{comp.seq}  {format_tag_line(comp.tags)}")
-    return EXIT_OK
+
+def do_remove(rest, path):
+    if len(rest) != 1:
+        raise AppError("remove 需要且只需要一个 #编号，例如：remove #7", EXIT_USAGE)
+    # 问不问由本层决定，删除本体转交 cmd_remove——和 cmd_add 的 confirm 一个套路，
+    # 于是「next_seq 不回收」的理由也只有一份。
+    return cmd_remove(SimpleNamespace(target=rest[0]), path, confirm=confirm_remove)
 
 
 def do_selftest(rest, path):
@@ -624,10 +547,10 @@ def get_inv(path):
     用户在编辑器里改完保存，回到这里做任何一次修改就把它静默抹掉了。另一个终端窗口
     改了库存也一样会被覆盖。
 
-    还有一个更微妙的好处：写入失败时天然回滚。save_inventory 在文件被别的程序占用时
-    抛 AppError，此时那个已经改脏的对象随函数返回被丢弃，下一条命令重新读到的还是
-    磁盘上的旧值——用户看到的错误信息和磁盘状态是一致的。换成常驻内存的话，用户会
-    看到新值、磁盘上却还是旧值，直到下一次保存成功才「莫名其妙」生效。
+    还有一个更微妙的好处：写入失败时天然回滚。inventory.py 的 save_inventory 在文件
+    被别的程序占用时抛 AppError，此时那个已经改脏的对象随函数返回被丢弃，下一条命令
+    重新读到的还是磁盘上的旧值——用户看到的错误信息和磁盘状态是一致的。换成常驻内存
+    的话，用户会看到新值、磁盘上却还是旧值，直到下一次保存成功才「莫名其妙」生效。
     """
     return load_inventory(path)
 
@@ -675,7 +598,8 @@ def advise(code, path):
     同一个常量在命令行里是给 shell 判断用的，在这里变成「该提示用户什么」的分派依据。
     """
     if code == EXIT_NOTFOUND:
-        print("提示：用 list 看全部；检索时加 -A 放宽为「任一命中」；或用 #序号 直接定位。")
+        # 不再提 -A：那是 search 的开关，而 NOTFOUND 现在只可能来自「编号不存在」。
+        print("提示：编号用 list 看全部；按标签找元件用 search，它会给出每条的编号。")
     elif code == EXIT_USAGE:
         print("提示：输入 help 查看命令用法。")
     elif code == EXIT_DATA:
