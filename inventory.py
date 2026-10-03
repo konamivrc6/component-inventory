@@ -1318,6 +1318,45 @@ def canonical_tags(tags):
     return [tag for slot in SLOT_ORDER for tag in groups[slot]]
 
 
+def resolve_package_answer(tags, answer):
+    """用户对封装追问的回答 → (追加后的标签, 表外封装名或 None)。
+
+    交互模式问「封装是什么」时，用户答的是一句话，而库里存的是标签。直接把整句
+    当一条标签存下来会出事：`直插 2.54` 这条标签带空格，而词表查的是去掉空格后的
+    键（`直插2.54`），谁也认不出它，于是「直插」和「2.54」两个词一起失效——本该是
+    封装的东西落进了显示层的「其它」列。
+
+    所以分三档，从紧到松：
+
+    1. **整句本身就是一个封装名**（`SOT23` / `Case A` / `NO PACKAGE`）→ 用规范名。
+       带空格的真封装名和哨兵靠这一档，所以它们仍然存成一条标签、仍然是规范写法。
+       这一档必须排在第二档前面：先拆的话 `Case A` 会变成 `Case` + `A` 两条，
+       规范写法就丢了。
+    2. **拆成词再和已有标签拼回去重判**——复用命令行那套切分（`tokenize_query`）
+       与同一个 `classify_tags`，规则只有一份。判得出封装就按普通标签收下，
+       于是 `直插 2.54` 变成两个普通标签，`直插` 还会被 `2.54` 吸收掉（`2.54`
+       派生出的安装方式就是直插），跟 `add C 直插 5x11 100uF` 的行为一致。
+    3. **还是认不出 → 整句当一条封装名存下来**。这是录入词表之外的封装的唯一途径，
+       所以不能拆散：拆成两条谁也不认，`classify_tags` 会报 package_missing，
+       整条 add 直接失败。
+
+    第二档**只**要求判得出封装，不额外要求「合并后没有别的问题」：万一用户答的
+    东西和已有标签冲突（电容上答 `100kΩ`），让 cmd_add 照常报类型冲突更好，
+    加守卫只会退回第三档，把一句有问题的回答静默存成封装名。
+    """
+    canon = canon_package(answer)
+    if canon is not None:
+        return tags + [canon], None
+
+    words = tokenize_query(answer)
+    if len(words) > 1:
+        merged = tags + words
+        if classify_tags(merged).package is not None:
+            return merged, None
+
+    return tags + [answer], answer
+
+
 _TYPE_HINT = "C R L D Q U J SW XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X"
 
 # 自动补全类型时，用来向用户说明推断依据的短语。
@@ -2708,6 +2747,45 @@ def run_selftest():
        "缺槽的行也要把尾列推到同一列")
     ok("MLCC" not in "".join(_lines), "一行都没有用到的槽整列不出现")
     eq(_lines[2], "#3  R  10k         直插  存量: 多(3)", "中间的空槽按宽度留白")
+
+    # --- 封装追问的回答怎么变成标签 ---
+    #
+    # 用户在「封装 > 」处答的是一句话，库里存的却是标签。整句原样存下来会造出
+    # `直插 2.54` 这种带空格的标签，而词表查的是去掉空格后的键（`直插2.54`），
+    # 谁也认不出它——本该是封装的东西于是落进显示层的「其它」列，两个词一起失效。
+    # 这一组钉三档收法。
+    eq(resolve_package_answer(["led", "共阴绿红"], "直插 2.54"),
+       (["led", "共阴绿红", "直插", "2.54"], None),
+       "多词回答拆成普通标签")
+    eq(resolve_package_answer(["C", "100nF"], "0805"), (["C", "100nF", "0805"], None),
+       "单词回答查表命中")
+    eq(resolve_package_answer(["C", "100nF"], "NO PACKAGE"),
+       (["C", "100nF", "无封装"], None),
+       "哨兵：整句就是一个封装名，存规范写法")
+    eq(resolve_package_answer(["C", "100nF"], "TO 220"),
+       (["C", "100nF", "TO-220"], None),
+       "带空格的真封装名不能被拆成两条")
+    eq(resolve_package_answer(["C", "10uF"], "Case A"), (["C", "10uF", "Case A"], None),
+       "Case 码同理")
+    eq(resolve_package_answer(["C", "100nF"], "MY-PKG"),
+       (["C", "100nF", "MY-PKG"], "MY-PKG"),
+       "表外的自定义封装名整句收下，并作为 extra_package 交出去")
+    eq(resolve_package_answer(["C", "100nF"], "My Pkg"),
+       (["C", "100nF", "My Pkg"], "My Pkg"),
+       "拆开也认不出封装的就不拆：拆成两条谁也不认，整条 add 会失败")
+    _tags, _extra = resolve_package_answer(["C", "100nF"], "MY-PKG")
+    ok(not classify_tags(_tags, extra_package=_extra).has("package_missing"),
+       "表外封装名必须能过封装校验，这是它作为 extra_package 交出去的理由")
+    # 第二档只要求判得出封装，不管别的问题：真冲突时让 cmd_add 当场报错，
+    # 好过退回第三档把一句有问题的回答静默存成封装名。
+    _tags, _extra = resolve_package_answer(["100nF"], "0805 100kΩ")
+    ok(_extra is None and _tags == ["100nF", "0805", "100kΩ"],
+       "回答里混进冲突的标签也照收")
+    ok(classify_tags(_tags).has("type_conflict"),
+       "冲突交给 cmd_add 报，不在这一层静默吞掉")
+    # 吸收：`2.54` 派生出的安装方式就是直插，和 add C 直插 5x11 100uF 一个行为。
+    _tags, _ = resolve_package_answer(["led", "共阴绿红"], "直插 2.54")
+    eq(classify_tags(_tags).absorbed, ("直插",), "多词回答里的直插仍会被封装吸收")
 
     # --- argv 重写 ---
     eq(normalize_argv(["--search", "51R"]), ["search", "51R"], "--search 应被重写")

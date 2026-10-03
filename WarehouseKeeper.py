@@ -37,7 +37,6 @@ from inventory import (
     STOCK_PROMPT,
     STOCK_QUESTION,
     Stock,
-    canon_package,
     classify_tags,
     cmd_add,
     cmd_show,
@@ -48,6 +47,7 @@ from inventory import (
     load_inventory,
     render_components,
     render_hits,
+    resolve_package_answer,
     resolve_target,
     run_selftest,
     save_inventory,
@@ -391,10 +391,9 @@ def ensure_package(tags):
         if not ans:
             sub_print("封装不能为空。确实没有封装的话，输入 NO PACKAGE。")
             continue
-        canon = canon_package(ans)
-        if canon is not None:
-            return tags + [canon], None
-        return tags + [ans], ans
+        # 回答可能是好几个词（`直插 2.54`），不能整句当一条标签塞进库里：
+        # 怎么拆、按什么顺序判，全在 resolve_package_answer 里，规则只有一份。
+        return resolve_package_answer(tags, ans)
 
 
 def ensure_stock(tags, opts):
