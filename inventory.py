@@ -185,7 +185,7 @@ TYPE_TO_DIM = {"R": "resistance", "C": "capacitance", "L": "inductance"}
 COARSE_LABELS = ("无", "极少", "少", "多", "极多")
 
 # --- 封装表 -------------------------------------------------------------------
-# 三类必需标签里，封装是唯一靠「查表」识别的一类。用死名单而不是通用正则，
+# 两类必需标签里，封装是唯一靠「查表」识别的一类。用死名单而不是通用正则，
 # 是因为名单可审查、零意外；而通用的「字母+数字」正则会猜错——它会把 NE555、
 # LM358 这些型号全吞成封装。
 PACKAGE_SIZE_CODES = frozenset({
@@ -936,7 +936,7 @@ def canon_medium(token):
     """把标签归约到规范介质词；不是介质则返回 None。
 
     与 canon_type / canon_package 同层同风格。介质是**参数**的一种，
-    不是第四类标签——「三类必需标签」的模型不变。
+    不是第四类标签——参数与类型 / 封装并列，只是不必需（见 classify_tags）。
     """
     t = normalize_text(token)
     if not t:
@@ -1040,7 +1040,6 @@ class TagPlan:
     type_evidence: tuple = ()            # 导致该类型的那些原始标签
     package: str | None = None
     medium: str | None = None            # 用户写下的介质（规范词）
-    params: tuple = ()
     issues: tuple = ()                   # (kind, detail)
     added_type: str | None = None        # 需要补进 tags 的类型码
     added_medium: str | None = None      # 需要补进 tags 的介质词
@@ -1052,7 +1051,10 @@ class TagPlan:
 
 
 def classify_tags(tags, extra_package=None):
-    """把标签分成 类型 / 封装 / 参数 三类，给出补全建议与问题清单。
+    """把标签分成 类型 / 封装 / 参数，给出补全建议与问题清单。
+
+    必需的是前两类——参数缺了不拦，它只决定槽位（主值 / 电气参数 / 其它），
+    进而影响显示列序与检索权重。
 
     关键是区分**类型标签**和**类型证据**：`1uF` 的 canon_type 是 None，
     它是参数标签，只是恰好能推断出类型。不分开的话 `1uF 0805 16V` 会被
@@ -1069,7 +1071,6 @@ def classify_tags(tags, extra_package=None):
     cands = []       # (类型码, 来源, 原始标签)
     packages = []
     media = []
-    params = []
     ambiguous = []   # µ 前缀这类真实歧义
     slots = []       # 与 tags 逐位对齐的槽位名，每轮循环恰记一笔
 
@@ -1091,10 +1092,8 @@ def classify_tags(tags, extra_package=None):
 
         med = canon_medium(tag)
         if med is not None:
-            # 介质算参数：它确实是这条元件的有效规格，所以 `C 0805 MLCC`
-            # 满足「至少一个非类型非封装的标签」，而 `C 0805` 不满足。
+            # 介质是一种参数（不是第四类标签），进「介质」槽位。
             media.append(med)
-            params.append(tag)
             # 顺带当类型证据。MEDIUM_ALIASES 那五个词全是电容的构造方式，
             # 出现即指向 C——`薄膜 104 100V` 里 104 和 100V 都推不出类型，
             # 靠的就是这一条。强度压在 medium 级，压不过型号表和单位，
@@ -1112,7 +1111,6 @@ def classify_tags(tags, extra_package=None):
             # 两个侧面（什么颜色、什么东西），分成两列反而读不成句。注意
             # canon_type 不查这张表，所以这一支必须自己记槽位。
             cands.append((desc, "descriptor", tag))
-            params.append(tag)
             slots.append("type")
             continue
 
@@ -1121,7 +1119,6 @@ def classify_tags(tags, extra_package=None):
             # 型号进「主值」列：对 `D 1N4148 SOD-123` 来说 1N4148 就是它的身份，
             # 和 `1uF` 之于电容没有区别。
             cands.append((pn, "partno", tag))
-            params.append(tag)
             slots.append("main")
             continue
 
@@ -1143,7 +1140,6 @@ def classify_tags(tags, extra_package=None):
                         # 连前缀字母一起记下来，render_issues 才不用回头去猜
                         # 用户写的是 u 还是 n。
                         ambiguous.append((letter, tag))
-            params.append(tag)
             # 耐压 / 功率 / 电流是附加条件，其余维度（含 dim 为 None 的裸前缀与
             # 中缀）都是元件的主值。
             slots.append("elec" if q.dim in _ELEC_DIMS else "main")
@@ -1151,7 +1147,6 @@ def classify_tags(tags, extra_package=None):
 
         # 落不进任何一类的残差。容差是这里唯一还认得出来的语义（`1%` 不是物理量，
         # parse_quantity 认不出），其余一律进「其它」列，排在最后。
-        params.append(tag)
         slots.append("elec" if _TOLERANCE_RE.match(normalize_text(tag)) else "other")
 
     # 封装是单值字段，而 `C 直插 5x11 100uF` 里两个标签都会命中封装。取最具体的
@@ -1184,8 +1179,6 @@ def classify_tags(tags, extra_package=None):
 
     if not packages and extra_package is None:
         issues.append(("package_missing", tuple(tags)))
-    if not params:
-        issues.append(("param_missing", tuple(tags)))
 
     added_type = None
     if type_code is not None and type_source != "explicit":
@@ -1223,7 +1216,6 @@ def classify_tags(tags, extra_package=None):
         type_evidence=evidence,
         package=package,
         medium=media[0] if media else None,
-        params=tuple(params),
         issues=tuple(issues),
         added_type=added_type,
         added_medium=added_medium,
@@ -1413,12 +1405,6 @@ def render_issues(plan, tags):
                 "  补法：加上封装，例如  C 0805 100nF 50V\n"
                 "  常见封装：0402 0603 0805 1206 / SOT-23 SOD-123 / DIP-8 SOIC-14 / 直插 贴片\n"
                 f"  若这个元件确实没有封装（散装、模块、自制件、电池座等），写  {PACKAGE_NONE}"
-            )
-        elif kind == "param_missing":
-            lines.append(
-                "除了类型和封装，至少还要有一个参数标签。\n"
-                f"  标签：{shown}\n"
-                "  补法：加上容值 / 耐压 / 型号，例如  C 0805 100nF 50V"
             )
     # 块与块之间空一行，而不是紧挨着。每个块只有标题顶格、续行缩进两格，若用一个 \n
     # 拼起来，第二个问题的标题就贴在上一块的缩进续行正下方，读起来像是那行漏了缩进，
@@ -2676,9 +2662,8 @@ def cmd_add(args, path, extra_package=None, confirm=None):
     if not tags:
         raise AppError("至少需要一个标签", EXIT_USAGE)
 
-    # 先把存量标签摘出来。必须排在三类标签校验**之前**——存量不是元件的属性，
-    # 不该参与「参数」的判定，否则 `add C 0805 qty23` 会因为那个 qty23 而被
-    # 误判成「有参数」。
+    # 先把存量标签摘出来。必须排在分类**之前**——存量不是元件的属性，它有自己的
+    # 字段，不摘的话 `qty23` 会被当成一条普通标签写进 tags。
     tags, tag_stock, stock_issues = extract_stock_tags(tags)
     if stock_issues:
         raise AppError("\n".join(msg for _, msg in stock_issues), EXIT_USAGE)
@@ -2687,7 +2672,7 @@ def cmd_add(args, path, extra_package=None, confirm=None):
         raise AppError(
             "存量给了两次：标签里写了，同时又给了 --level / --qty。二选一。", EXIT_USAGE)
 
-    # 三类必需标签的校验与类型补全。放在这里（而不是 load/save 层）是为了让
+    # 必需标签的校验与类型补全。放在这里（而不是 load/save 层）是为了让
     # 命令行和 WarehouseKeeper 的 do_add 自动同享——后者复用本函数。
     plan = classify_tags(tags, extra_package=extra_package)
     if plan.issues:
@@ -3401,8 +3386,6 @@ def run_selftest():
     eq(classify_tags(["C", "直插", "5x11", "100uF"]).package, "5x11", "机械尺寸应压过安装方式")
     eq(classify_tags(["C", "贴片", "0805", "100nF"]).package, "0805", "尺寸码应压过安装方式")
     eq(classify_tags(["C", "贴片", "100nF", "50V"]).package, "贴片", "只有安装方式时照常采用")
-    # 两个标签都被封装槽吃掉了，参数仍然是空的——多写一个封装不等于有了参数。
-    ok(classify_tags(["C", "直插", "5x11"]).has("param_missing"), "C 直插 5x11 仍缺参数")
 
     # --- 吸收冗余的安装方式标签 ---
     eq(classify_tags(["C", "直插", "5x11", "100uF"]).absorbed, ("直插",), "直插应被 5x11 吸收")
@@ -3468,21 +3451,22 @@ def run_selftest():
     ok(match_token("直插", _c5)[0] > 0, "搜直插应命中只写了 5x11mm 的元件")
     eq(match_token("贴片", _c5)[0], 0.0, "该元件不该被搜贴片命中")
 
-    # --- 冲突与三类校验 ---
+    # --- 冲突与必需标签校验 ---
     ok(classify_tags(["1uF", "100Ω", "0805"]).has("type_conflict"), "容值与阻值并存应判冲突")
     ok(classify_tags(["10k", "100p", "0603"]).has("type_conflict"), "两个惯例推出不同码应判冲突")
     ok(classify_tags(["薄膜", "100k", "0805"]).has("type_conflict"), "介质指向 C 与惯例指向 R 应判冲突")
-    ok(classify_tags(["C", "0805"]).has("param_missing"), "C 0805 缺参数")
+    # 参数不是必需项：类型和封装齐了就放行，一个参数都没有也照收。
+    ok(not classify_tags(["C", "0805"]).issues, "C 0805 不再被拦——参数已改为可选")
     ok(classify_tags(["C", "100nF"]).has("package_missing"), "C 100nF 缺封装")
     ok(not classify_tags(["C", "100nF"]).has("type_missing"), "C 100nF 不缺类型")
     _p = classify_tags(["104", "473"])
     ok(_p.has("type_missing") and _p.has("package_missing"), "104 473 同时缺类型与封装")
-    ok(not _p.has("param_missing"), "104 473 不缺参数")
     for good in (["J", "直插", "2.54", "40P"],
+                 ["排针", "2.54"],
                  ["C", "1uF", "16V", "无封装"],
                  ["C", "0805", "贴片", "100nF", "50V"],
                  ["D", "1N4148", "SOD-123"]):
-        ok(not classify_tags(good).issues, f"{good} 应当完整通过三类校验")
+        ok(not classify_tags(good).issues, f"{good} 应当完整通过校验")
 
     # --- 补全与幂等 ---
     eq(classify_tags(["1uF", "0805"]).added_type, "C", "1uF 0805 应补类型 C")
@@ -3630,15 +3614,14 @@ def run_selftest():
     ok(tuple(extract_stock_tags(["多", "少"])[2]), "两个中文等级词同样报冲突")
     ok(tuple(extract_stock_tags(["none", "lots"])[2]), "两个英文等级词同样报冲突")
 
-    # --- 存量标签不参与「参数」判定 ---
-    # 这就是必须在校验三类标签**之前**摘存量的原因。
+    # --- 存量标签不留在 tags 里 ---
+    # 这就是必须在校验**之前**摘存量的原因：存量有自己的字段，留着就会被当普通标签存进去。
     _rest, _s, _ = extract_stock_tags(["C", "0805", "qty23"])
     ok(_s is not None, "qty23 应被摘成存量")
-    ok(classify_tags(_rest).has("param_missing"),
-       "C 0805 qty23 摘掉存量后仍然缺参数")
+    eq(tuple(_rest), ("C", "0805"), "qty23 不该留在标签里")
     _rest, _s, _ = extract_stock_tags(["C", "0805", "100nF", "lots"])
     ok(_s is not None, "lots 应被摘成存量")
-    eq(tuple(_rest), ("C", "0805", "100nF"), "英文等级词也不该算进参数")
+    eq(tuple(_rest), ("C", "0805", "100nF"), "英文等级词同样进存量字段，不进标签")
 
     # --- stock 命令的值语法 ---
     #
