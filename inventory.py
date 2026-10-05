@@ -110,7 +110,15 @@ TYPE_ALIASES = {
     "Q": ("三极管", "晶体管", "transistor", "bjt", "mos", "场效应管", "mosfet"),
     "U": ("芯片", "ic", "集成电路", "运放", "mcu", "单片机", "稳压器"),
     "J": ("连接器", "接插件", "connector", "插座", "排母", "排针", "端子", "header"),
-    "SW": ("开关", "switch", "按键", "轻触开关", "按钮", "拨动开关"),
+    # `s` 是 IEC / GB 的开关代号（ANSI 才用 SW）。单字母代号在本项目本是常态——R /
+    # C / L / D / Q / U / J / X 的规范码本身就是单字母，搜单字母全好使；唯独开关当初
+    # 选了双字母，于是 `search S` 既过不了类型层，又被子串层的单字符防护挡死，一条
+    # 开关都搜不到。补上它，录入与检索两侧都归约到 SW。
+    # 代价：`s` 会随之进 VOCAB 分词表，`SR` / `LS` 这类纯字母两字标签今后会被最大
+    # 匹配切段而判成类型。这类误判对 c / r / l 等单字母代号早已存在（`RC` 今天就会被
+    # 判成电阻），加 `s` 只是把暴露面扩大一个字母；含数字的型号（SS34、S8050）不受
+    # 影响，分词带残余回退，整段退回原 token。
+    "SW": ("开关", "switch", "按键", "轻触开关", "按钮", "拨动开关", "s"),
     "XTAL": ("晶振", "晶体", "谐振器", "crystal", "resonator"),
     "LED": ("发光二极管", "led", "指示灯", "灯珠"),
     "OPTO": ("光耦", "光电耦合器", "optocoupler"),
@@ -2934,6 +2942,8 @@ def run_selftest():
     eq(canon_type("cap"), "C", "cap → C")
     eq(canon_type("CAPACITOR"), "C", "大小写无关")
     eq(canon_type("C"), "C", "规范码自身")
+    eq(canon_type("S"), "SW", "S → SW（IEC 的开关代号）")
+    eq(canon_type("s"), "SW", "大小写无关")
     eq(canon_type("电阻"), "R", "电阻 → R")
     eq(canon_type("贴片电容"), "C", "复合词 贴片电容 → C")
     eq(canon_type("发光二极管"), "LED", "复合词 发光二极管 → LED")
@@ -2941,6 +2951,10 @@ def run_selftest():
     eq(canon_type("金属膜电阻"), "R", "子串回退：金属膜电阻 → R")
     eq(canon_type("x7r"), None, "X7R 不应因含字母 x 被判成跳线")
     eq(canon_type("C0G"), None, "C0G 不应因含字母 c 被判成电容")
+    # 这条钉的是「加 `s` 的代价」，不是回归：单字母代号进了 VOCAB，纯字母两字标签
+    # 就会被最大匹配切段而判成类型。`RC` → R 是同样的道理，早在 `s` 之前就有。
+    # 写出来是为了让它成为一份显式契约——将来若想收紧分词，得先看到这里。
+    eq(canon_type("SR"), "SW", "纯字母两字标签 SR 会被切段判成类型——已知代价，非回归")
 
     # --- 切分残余必须退回原 token ---
     # `capacitor` 会被最大匹配切出 cap + c + r 三块碎片，拼出的语义
@@ -3729,6 +3743,11 @@ def run_selftest():
     _broken = Component(id="bbbbbbbb-1111-2222-3333-444444444444", seq=2,
                         tags=["1uF", "16v", "0805"], stock=Stock("coarse", level=0))
     ok(match_token("C", _broken)[0] == 0, "没补类型的旧记录搜 C 命中不了——这就是当初的 bug 现场")
+    # 本次修的 bug 现场：库里的开关记的是中文原字（`拨动开关`），`S` 曾一条也搜不到。
+    _sw = Component(id="cccccccc-1111-2222-3333-444444444444", seq=3,
+                    tags=["拨动开关", "3A", "直插", "12D10"], stock=Stock("coarse", level=0))
+    ok(match_token("S", _sw)[0] > 0, "S 应命中开关——IEC 代号，本次修的 bug 现场")
+    ok(match_token("SW", _sw)[0] > 0, "SW 照旧命中")
 
     # --- 补类型会激活 hint，把裸数字标签「唤醒」---
     eq(dim_hint_for_tags(["C", "0805", "100"]), "capacitance", "有 C 标签时 hint 是容值")
