@@ -520,7 +520,28 @@ PARTNO_PATTERNS = (
     (re.compile(r"^(?:HT|ME|XC|SGM)\d{3,}"), "U"),          # 常见 LDO 厂牌
     (re.compile(r"^(?:TDA|TEA)\d{3,}"), "U"),               # 音频功放
     (re.compile(r"^WS\d{4}"), "LED"),                       # WS2812
-    (re.compile(r"^(?:XH|VH|PH|ZH|GH|EH|MX|JST)[\d.]+$"), "J"),   # XH2.54 这类连接器系列
+    # 连接器系列不在这里——它走下面单独的 _connector_series，理由见那里。
+)
+
+# 连接器系列名的形态。**三种写法都要认**，因为规格书、丝印、手上随手打出来的
+# 各不相同：
+#   裸系列名    `XH` / `PH` / `jst`        —— 最容易被写出来，也是原先漏掉的那一种
+#   带脚距连写  `XH2.54` / `ph2.0` / `VH3.96`  —— 规格书上的标准写法
+#   带连接符    `JST-XH` / `XH-2.54`        —— 品牌与系列分开写
+#
+# 原先这条规则寄生在 PARTNO_PATTERNS 里（`^(?:XH|VH|…)[\d.]+$`），三重失守：
+# 它要求「系列名 + 数字」连写，裸 `XH` 匹配不上；`_partno_type` 开头那道
+# 「少于三个字符不看」的闸把两字符的系列名整个挡在门外；正则还是大小写敏感的，
+# 而用户打的是小写 `jst`。于是 `add 2p 2.54 jst XH` 在引擎眼里没有任何类型证据，
+# 只剩下 `2p` 那个「皮法 → 电容」的惯例可走——一个明摆着的连接器被记成了电容。
+#
+# 大小写与分隔符一律不敏感（IGNORECASE，且系列名与脚距之间的 `-` / `_` / 空格可
+# 有可无），这与 EXPLICIT_PARTNO 刻意保留大小写相反：那里比对的是型号，
+# ss14 与 SS14 不是一回事；而系列名不携带大小写语义，JST 就是 jst。
+_CONNECTOR_SERIES_RE = re.compile(
+    r"^(?:jst[-_ ]?)?(?:xh|vh|ph|zh|gh|eh|mx)(?:[-_ ]?[\d.]+)?$"
+    r"|^jst$",
+    re.IGNORECASE,
 )
 
 # 显式型号表，**优先于上面的模式表**。
@@ -952,6 +973,20 @@ def canon_medium(token):
     return MEDIUM_TO_CANON.get(t.casefold())
 
 
+def _connector_series(token):
+    """token 是连接器系列名就返回它的类型码 "J"，否则 None。
+
+    单列一个函数、**排在 _partno_type 那道长度闸之前**判，是因为两个字符正是
+    这一族的常态（XH / VH / PH / ZH / GH / EH / MX）：那道闸防的是 M7 / K2 这类
+    与 EIA 码、丝印碰撞概率高的任意两字符令牌，而这里是一张封闭白名单，候选
+    空间有限，撞车面完全不同。把系列名塞进 PARTNO_PATTERNS 是行不通的——它会
+    先被长度闸挡下，这正是原先那条规则形同虚设的原因之一。
+
+    形态与大小写的容忍度见 _CONNECTOR_SERIES_RE 的注释。
+    """
+    return "J" if _CONNECTOR_SERIES_RE.match(normalize_text(token)) else None
+
+
 @lru_cache(maxsize=None)
 def _partno_type(token):
     """型号 → 类型码。长度少于 3 一律不看，字母段要求原样大写。
@@ -959,8 +994,13 @@ def _partno_type(token):
     这是拦住 `1N4148` 的唯一手段：不拦的话它会走惯例推断，而
     parse_quantity("1N4148") 给出 1.4148e-9（N 被当成纳），一个二极管就
     被猜成了电容。两字符的 `M7` / `K2` 碰撞概率太高，交给用户显式指定。
+
+    连接器系列是那道长度闸的**唯一例外**，判在它前面，理由见 _connector_series。
     """
     t = normalize_text(token)
+    series = _connector_series(t)
+    if series is not None:
+        return series
     if len(t) < 3:
         return None
     explicit = EXPLICIT_PARTNO.get(t)
@@ -1009,6 +1049,79 @@ def _plausible(value, code):
     """惯例推断出的量级是否落在该类型的合理范围里。"""
     lo, hi = PLAUSIBLE[code]
     return lo <= abs(value) <= hi
+
+
+# --- 引脚数 -------------------------------------------------------------------
+# 「N 脚」的写法：纯整数 + p/P。`4p7` 是中缀容值、`22pF` 带单位、`0805` 是尺寸码，
+# 都不走这条。
+_PIN_COUNT_RE = re.compile(r"^(?P<n>\d{1,3})[pP]$")
+
+# 脚数上限。200 已经覆盖常见排针（1x40）、牛角（2x32）、杜邦；再大就不像脚数，
+# 更像把别的数字认错了。
+_PIN_COUNT_MAX = 200
+
+
+@lru_cache(maxsize=None)
+def _pin_count(token):
+    """token 是「N 脚」写法时返回 N（整数），否则 None。
+
+    **N 从原始 token 里取，不能用 parse_quantity 的值**：`2p` 的 q.value 是
+    2e-12（pico 前缀已经算进去了），拿它当脚数只会得到 0。
+
+    大写 `P` 一并收下。它在 TERMINAL_CONVENTION 里没有条目、也不在
+    _AMBIGUOUS_PREFIX 里，所以一向既不推类型也不报歧义，`add 2P 2.54` 会一路
+    掉进「无法确定元件类型」。而 README 早就把 `40P` 定成排针的引脚数写法
+    （`J 2.54 1x40 40P`）——同一个约定的两种写法不该有不同命运。收在这里是安全的：
+    只有在连接器语境下才会被采用（见 classify_tags），`40P` 单独出现仍是老样子。
+    """
+    m = _PIN_COUNT_RE.match(normalize_text(token))
+    if m is None:
+        return None
+    digits = m["n"]
+    if len(digits) > 1 and digits[0] == "0":
+        return None  # 前导零是封装 / 尺寸特征（0402 / 0603），不是脚数
+    n = int(digits)
+    return n if 1 <= n <= _PIN_COUNT_MAX else None
+
+
+def _connector_hint(tags, extra_package=None):
+    """标签集合里有没有「这是连接器」的证据。有就返回 (种类, 证据标签)，否则 None。
+
+    四种证据，任一成立即可：
+      "type"   —— 指向 J 的类型词与别名：连接器 / 排针 / 排母 / header…
+      "desc"   —— 指向 J 的中文描述词：杜邦 / 牛角 / 端子
+      "series" —— 连接器系列名：XH / jst / XH2.54…（见 _connector_series）
+      "pitch"  —— 脚距封装：1.27 / 2.54 / 3.81 / 5.08 / 7.62（_PACKAGE_PITCH）
+
+    脚距能当证据，是因为库里这种封装基本只可能是排针、排母、杜邦、接线端子的
+    间距——`排针 2.54` 这条记录除了 2.54 确实没有别的可写。代价是它有假阳性面：
+    直插瓷片、薄膜电容也用 2.54 / 5.08 脚距。所以脚距是**最弱的一档**，只在
+    没有别的类型证据时才起作用（本函数只用来改判 `Np`，绝不自己造候选），
+    而电容那边有更强的写法可用——`22pF` 带单位、`C 22p 2.54` 显式。
+
+    种类要返回给调用方，是因为只有 "pitch" 这一档不产生自己的类型候选：
+    类型词 / 描述词 / 系列名各自都会在 classify_tags 里落一条 J 候选，标签本来
+    就在 type_evidence 里；脚距不会，得由调用方补进去，否则回显会说不出依据。
+
+    刻意**不缓存**：判据是整批标签，同一个 `2p` 在连接器语境下是脚数、在电容
+    语境下是皮法。以单个 token 为键缓存会把两种语境混成一种。
+
+    这个函数纯读，不改动 tags——自检里有断言钉着 classify_tags 不动传入的列表。
+    """
+    for tag in tags:
+        if canon_type(tag) == "J":
+            return "type", tag
+        if DESCRIPTOR_TYPE.get(tag.casefold()) == "J":
+            return "desc", tag
+        if _connector_series(tag) is not None:
+            return "series", tag
+        pkg = canon_package(tag)
+        if pkg is not None and _pkg_key(pkg) in _PACKAGE_PITCH:
+            return "pitch", tag
+    # 交互模式下用户刚答的封装还没进 tags，但它同样是语境的一部分。
+    if extra_package is not None and _pkg_key(extra_package) in _PACKAGE_PITCH:
+        return "pitch", extra_package
+    return None
 
 
 # --- 显示槽位 -----------------------------------------------------------------
@@ -1082,6 +1195,11 @@ def classify_tags(tags, extra_package=None):
     ambiguous = []   # µ 前缀这类真实歧义
     slots = []       # 与 tags 逐位对齐的槽位名，每轮循环恰记一笔
 
+    # 连接器语境，在循环前一次算好：`Np` 在连接器上是「N 脚」，在别处才是皮法。
+    # 必须整批一起判而不是逐条看自己——`add 2p 2.54 jst XH` 里的证据（2.54、jst、
+    # XH）全排在 `2p` 后面，逐条判会一条也看不到。
+    conn_hint = _connector_hint(tags, extra_package)
+
     for tag in tags:
         code = canon_type(tag)
         if code is not None:
@@ -1140,14 +1258,31 @@ def classify_tags(tags, extra_package=None):
                 conv = _convention_letter(tag)
                 if conv is not None:
                     letter, position = conv
-                    table = INFIX_CONVENTION if position == "infix" else TERMINAL_CONVENTION
-                    guess = table.get(letter)
-                    if guess is not None and _plausible(q.value, guess):
-                        cands.append((guess, "convention", tag))
-                    elif letter in _AMBIGUOUS_PREFIX:
-                        # 连前缀字母一起记下来，render_issues 才不用回头去猜
-                        # 用户写的是 u 还是 n。
-                        ambiguous.append((letter, tag))
+                    # 裸的 `Np` 在连接器语境下是「N 脚」而不是皮法：`排母 3p 2.54`、
+                    # `XH 4p`、`2p 2.54 jst XH` 里的 3p / 4p / 2p 都是脚数。这里把
+                    # 那个错的 C 候选换成 J，而不是新造一个候选——所以没有连接器
+                    # 证据时一切照旧（`22p` 仍是 22pF），`add 2.54` 也仍然报缺类型。
+                    #
+                    # 只认 terminal 位置：`1p2` 这类中缀是容值，不可能是脚数。
+                    # 槽位不走特殊路径——裸前缀的 dim 是 None，下面那处共用的判定
+                    # 本来就会把它记成「主值」，和 `3p` 今天的位置一致。
+                    pin = _pin_count(tag) if position == "terminal" else None
+                    if pin is not None and conn_hint is not None:
+                        hint_kind, hint_tag = conn_hint
+                        cands.append(("J", "convention", tag))
+                        # 只有脚距这一档要把证据标签补进候选——类型词、描述词、
+                        # 系列名各自都会产生自己的 J 候选，标签早就在依据里了。
+                        if hint_kind == "pitch":
+                            cands.append(("J", "convention", hint_tag))
+                    else:
+                        table = INFIX_CONVENTION if position == "infix" else TERMINAL_CONVENTION
+                        guess = table.get(letter)
+                        if guess is not None and _plausible(q.value, guess):
+                            cands.append((guess, "convention", tag))
+                        elif letter in _AMBIGUOUS_PREFIX:
+                            # 连前缀字母一起记下来，render_issues 才不用回头去猜
+                            # 用户写的是 u 还是 n。
+                            ambiguous.append((letter, tag))
             # 耐压 / 功率 / 电流是附加条件，其余维度（含 dim 为 None 的裸前缀与
             # 中缀）都是元件的主值。
             slots.append("elec" if q.dim in _ELEC_DIMS else "main")
@@ -1371,6 +1506,32 @@ _SOURCE_LABEL = {
     "descriptor": "这是行业里常见的叫法",
     "convention": "按行业惯例",
 }
+
+# 推断来源里哪些算**弱证据**——只有这些在交互模式下要先点一次头。
+#
+# 强证据（带单位的量、型号表）是硬的，每次录入都追问只是噪音；弱证据是猜的，
+# 而猜错的代价是**把错的类型写进盘**（`add 2p 2.54 jst XH` 被记成电容就是这么来的，
+# 而且写完只回显一句依据，看到的时候已经落盘了）。
+#
+# 频率兜底（`3225 16MHz` → XTAL）也标着 convention，所以它同样会被问一句。这是
+# 有意保留的：16MHz 说的是主频还是晶振本来就是猜的（`STM32F103 16MHz` 里就压不过
+# 型号表），弱证据就不该悄悄生效。
+_WEAK_TYPE_SOURCES = frozenset({"convention", "descriptor", "medium"})
+
+
+def inference_note(plan):
+    """类型推断的自我说明，一句话。回显与交互确认共用这一份。
+
+    只在 plan.added_type 非空时有意义——没补类型就没有「依据」可讲，调用方
+    也该在那之前就分好支（两处调用都判过 plan.added_type）。
+
+    项目里反复强调「同一句话不允许出现第二份」，补全依据尤其如此：用户写入前
+    在确认里看到的那句，和写入后回显的那句必须逐字一致，否则他会怀疑两处说的
+    是不是同一回事。
+    """
+    ev = "、".join(f"`{t}`" for t in plan.type_evidence)
+    return (f"自动补全类型标签 {plan.added_type}，依据：{ev}，"
+            f"{_SOURCE_LABEL.get(plan.type_source, '')}")
 
 
 def render_issues(plan, tags):
@@ -2442,7 +2603,8 @@ def build_parser():
     _add_stock_options(pa)
     pa.add_argument("--note", default="", help="备注")
     pa.add_argument("--force", action="store_true",
-                    help="与库中元件存在包含关系时仍然添加，不报错退出")
+                    help="与库中元件存在包含关系时仍然添加，不报错退出"
+                         "（交互模式下同时也跳过弱证据推断的类型确认）")
 
     pst = sub.add_parser("stock", parents=[sub_common], help="更改存量")
     # target 与 value 都是单值：目标只认 `#编号`，值是一个 token。
@@ -2648,7 +2810,7 @@ def cmd_search(args, path):
     return EXIT_OK if hits else EXIT_NOTFOUND
 
 
-def cmd_add(args, path, extra_package=None, confirm=None):
+def cmd_add(args, path, extra_package=None, confirm=None, confirm_inference=None):
     """添加元件。
 
     extra_package 只由交互模式传入（见 classify_tags）：命令行入口不传，
@@ -2657,8 +2819,13 @@ def cmd_add(args, path, extra_package=None, confirm=None):
     confirm 是第二个只由交互模式传入的通道：命中包含关系时由它决定加不加，
     返回 True 继续、False 取消。命令行不传（None），改为直接报错退出。
 
-    检测放在本函数而不是 WarehouseKeeper，一是两个入口只能有一份判定和一份
-    措辞，二是包含判定必须看到 classify_tags 定稿后的标签——`add 0805 100nF
+    confirm_inference 是第三个同类通道：类型是**弱证据**推出来的时候由它决定
+    认不认（判定见 _WEAK_TYPE_SOURCES）。命令行不传就照旧直接补上——脚本化录入
+    要的是不被打断，而它至少还能从回显里看到补了什么。回调返回 False 就中止
+    整次添加，退出码仍是 EXIT_OK——「我问了、你不想加」不是错误。
+
+    三个检测都放在本函数而不是 WarehouseKeeper，一是两个入口只能有一份判定和
+    一份措辞，二是它们都必须看到 classify_tags 定稿后的标签——`add 0805 100nF
     50V` 补出来的那个 C 要是赶不上，跟库里任何一条电容都比不出关系来。
     """
     inv = load_inventory(path)
@@ -2702,11 +2869,23 @@ def cmd_add(args, path, extra_package=None, confirm=None):
 
     stock = tag_stock if tag_stock is not None else make_stock(args, default_coarse=True)
 
+    # --force 只在这一层读一次，本函数里两处（类型确认、包含关系）共用同一个值。
+    # 它的意思是「我看过了，照加」，对两问都成立。
+    force = getattr(args, "force", False)
+
+    # 类型是弱证据推出来的，就在写入前拦一道。位置选在这里（而不是更早）是因为
+    # 补出来的类型与介质都已经插好、冗余标签已经删掉，tags 已经是即将存盘的那一份；
+    # 又选在包含检查之前，是因为「这东西到底是什么」比「库里有没有类似的」更靠前，
+    # 答否时也不必再白算一遍包含关系。此时 Component 还没构造，取消不留任何痕迹。
+    if (plan.added_type and plan.type_source in _WEAK_TYPE_SOURCES
+            and confirm_inference is not None and not force):
+        if not confirm_inference(plan, tags, stock):
+            return EXIT_OK
+
     # 包含检查必须排在存盘之前：命令行报错、交互模式取消，两种拒绝都不能落盘。
     # 用的也是定稿后的 tags——类型补过、冗余删过，才对得上真正要写进去的东西。
-    # force 只在这一个地方读，两个入口不必各自分叉。
     relations = find_containment(inv.components, tags)
-    if relations and not getattr(args, "force", False):
+    if relations and not force:
         if confirm is None:
             raise AppError(
                 render_containment(relations, tags)
@@ -2735,8 +2914,7 @@ def cmd_add(args, path, extra_package=None, confirm=None):
     # 自动补全是在改用户的数据，比匹配更需要解释自己。项目里反复强调的
     # 「模糊匹配必须能解释自己」在这里同样适用，而且这里的要求更高。
     if plan.added_type:
-        ev = "、".join(f"`{t}`" for t in plan.type_evidence)
-        print(f"  （自动补全了类型标签 {plan.added_type}，依据：{ev}，{_SOURCE_LABEL.get(plan.type_source, '')}）")
+        print(f"  （{inference_note(plan)}）")
     if plan.added_medium:
         print(f"  （自动补全了介质标签 {plan.added_medium}，依据：片式尺寸码的电容就是陶瓷的）")
     if plan.absorbed:
@@ -3355,6 +3533,53 @@ def run_selftest():
     eq(tcode(["L", "0805", "100n"]), "L", "有显式类型就不该报歧义")
     eq(tcode(["0805", "MLCC", "100n"]), "C", "有介质指向就不该报歧义")
     eq(tcode(["0805", "22p"]), "C", "p 前缀不报歧义（pH 几乎不存在）")
+
+    # --- 引脚数 `Np` 与连接器语境 ---
+    # 下面是那个 bug 的原样复现。`2p` 是「2 脚」，不是 2pF；原先 parse_quantity
+    # 把它读成 2e-12（pico），一路惯例推断成电容，而 `jst` / `XH` 在引擎眼里
+    # 根本不存在（系列名规则要求连写、还被两字符长度闸挡着），于是没有任何证据
+    # 能压过那个错的 C——一条 JST XH 连接器就这么被记成了电容，还落了盘。
+    _pin = classify_tags(["2p", "2.54", "jst", "XH"])
+    eq(_pin.type_code, "J", "连接器语境下 2p 是引脚数，不是 2pF")
+    eq(_pin.added_type, "J", "推出来的 J 要能补进标签")
+    eq(_pin.type_source, "partno", "系列名是强证据，来源应标成型号")
+    eq(_pin.type_evidence, ("2p", "2.54", "jst", "XH"), "依据要点名所有参与判断的标签")
+    _cs = ["2p", "2.54", "jst", "XH"]
+    classify_tags(_cs)
+    eq(_cs, ["2p", "2.54", "jst", "XH"], "语境判定同样不得改动传入的 tags（classify_tags 只读）")
+
+    # 四种连接器证据各自都要能成立
+    eq(tcode(["2p", "2.54"]), "J", "脚距即连接器证据")
+    eq(classify_tags(["2p", "2.54"]).type_evidence, ("2p", "2.54"),
+       "脚距这一档要自己把证据标签补进依据，否则回显说不出理由")
+    eq(tcode(["2p", "2.54", "杜邦"]), "J", "中文描述词即连接器证据")
+    eq(tcode(["排母", "3p", "2.54"]), "J", "类型词即连接器证据（3 脚排母）")
+    for tag in ("XH", "xh", "jst", "JST", "JST-XH", "XH-2.54", "PH2.0", "VH3.96"):
+        eq(tcode([tag]), "J", f"连接器系列 {tag}")
+    eq(canonical_tags(["2p", "2.54", "jst", "XH", "J"]), ["J", "2p", "jst", "XH", "2.54"],
+       "系列名是型号，进主值列——存盘顺序跟着槽位走")
+
+    # 大写 `P`：README 早就把 `40P` 定成排针的引脚数写法，两种写法不该有两个命运
+    eq(tcode(["2P", "2.54"]), "J", "大写 P 在连接器语境下同样按引脚数读")
+    eq(tcode(["40P", "2.54"]), "J", "40P 同理")
+
+    # 边界：语境只**改判**已经存在的候选，绝不自己造候选
+    eq(tcode(["2p"]), "C", "没有连接器证据时 2p 仍是 2pF")
+    eq(tcode(["2p", "0805"]), "C", "片式尺寸码不是连接器证据")
+    eq(tcode(["22p", "0805", "50V"]), "C", "片式电容照旧")
+    eq(tcode(["1p2", "2.54"]), "C", "中缀 1p2 是容值，不可能是脚数")
+    eq(tcode(["22pF", "2.54"]), "C", "带单位的容值（强度 2）压过脚距（强度 1）")
+    eq(tcode(["2.54"]), None, "光有脚距推不出类型")
+    ok(classify_tags(["2.54"]).has("type_missing"), "光有脚距仍应报缺类型")
+    eq(tcode(["40P"]), None, "没有连接器语境时 40P 什么都不是（老样子）")
+    eq(tcode(["2P"]), None, "没有连接器语境时 2P 同样什么都不是")
+    # 同强度冲突照旧报出来，不静默任选：容值与系列名都是强度 2
+    ok(classify_tags(["100nF", "XH", "2.54"]).has("type_conflict"),
+       "容值与连接器系列同强度不同码，应报冲突而不是任选一个")
+
+    # 系列表是闭集，不能把别的两字符令牌一起吃进来——那正是长度闸防的东西
+    for tag in ("M7", "K2", "N1", "X7R", "C0G", "XHX", "SH1.0"):
+        ok(_partno_type(tag) is None, f"{tag} 不该被连接器系列认走")
 
     # --- 型号表补漏 ---
     for tag, want in (("IRLZ44N", "Q"), ("IRFZ44N", "Q"), ("2SK170", "Q"),

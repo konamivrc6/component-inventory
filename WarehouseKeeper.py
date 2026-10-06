@@ -38,6 +38,7 @@ from inventory import (
     STOCK_PROMPT,
     STOCK_QUESTION,
     apply_limit,
+    canonical_tags,
     classify_tags,
     cmd_add,
     cmd_remove,
@@ -45,6 +46,7 @@ from inventory import (
     default_data_path,
     extract_stock_tags,
     format_tag_line,
+    inference_note,
     load_inventory,
     make_stock,
     render_components,
@@ -102,7 +104,7 @@ HELP_TEXT = """\
   --level 0-4     粗略存量：0 无 / 1 极少 / 2 少 / 3 多 / 4 极多
   --qty N         精确存量个数（与 --level 互斥）
   --note 文本     备注（只有 add 有；会显示在 list 与 search 里）
-  --force         与库中元件重复或包含时仍然添加，不追问（只有 add 有）
+  --force         与库中元件重复或包含、或类型是弱证据推出来的时，仍然添加，不追问（只有 add 有）
   -A, --any       检索时放宽为「任一命中」，默认是全部命中
   -n N            最多显示 N 条（默认 20；须为正整数）
 
@@ -374,6 +376,24 @@ def confirm_containment(relations, tags):
     return False
 
 
+def confirm_inference(plan, tags, stock):
+    """类型是弱证据推出来的，写入前把「推成什么、依据是什么、最终存成什么」摊开问一句。
+
+    依据那一句复用 inference_note——它也是写入后回显用的同一份措辞，两处必须
+    逐字一致（见那个函数的 docstring）。补齐的证明在这里：用户看到的不只是
+    「我猜是 J」，还有这条记录长什么样、存量记多少，然后才决定认不认。
+
+    问句用「按此添加？」而不是「仍然添加？」——后者是包含关系那一问的话，两问
+    可能连着出现，问句重了会让人以为同一个问题问了两次。
+    """
+    sub_print(f"  {inference_note(plan)}")
+    sub_print(f"  存成：{format_tag_line(canonical_tags(tags))}   存量: {stock.label()}")
+    if confirm("按此添加？(y/N) > "):
+        return True
+    print("已取消。")
+    return False
+
+
 def do_add(rest, path):
     opts, tags = scan_options(rest, ADD_SPEC)
     if not tags:
@@ -418,6 +438,9 @@ def do_add(rest, path):
         extra_package=provided,
         # 永远传回调；--force 的判定只发生在 cmd_add 里，这一层不分叉。
         confirm=confirm_containment,
+        # 同理，又一个只由交互模式传入的确认回调——命令行没有它，弱证据推出来的
+        # 类型会直接补上，那边靠回显自证。
+        confirm_inference=confirm_inference,
     )
 
 
