@@ -44,7 +44,6 @@ from inventory import (
     cmd_remove,
     cmd_stock,
     default_data_path,
-    extract_stock_tags,
     format_tag_line,
     inference_note,
     load_inventory,
@@ -92,7 +91,8 @@ LIST_SPEC = {
 HELP_TEXT = """\
 命令
   search 查询词...               检索（多个词之间是「全部命中」）
-  add    标签...                 添加元件（缺封装或数量时会问你；类型能推断的会自动补；与已有元件重复时会确认）
+  add    标签...                 添加元件（缺封装会先问你；没给数量的先按「无」入库，随后再问一句；
+                                 类型能推断的会自动补；与已有元件重复时会确认）
   stock  #编号 [值]              更改存量（值可以直接写：多 / plenty / 23 / +5）
   list                           列出全部（--low 只看存量偏低的）
   remove #编号                   删除元件（会二次确认）
@@ -102,6 +102,7 @@ HELP_TEXT = """\
 
 选项
   --level 0-4     粗略存量：0 无 / 1 极少 / 2 少 / 3 多 / 4 极多
+                  （0 就是 0，与 --qty 0 是同一个值；1-4 才是真粗略档）
   --qty N         精确存量个数（与 --level 互斥）
   --note 文本     备注（只有 add 有；会显示在 list 与 search 里）
   --force         与库中元件重复或包含、或类型是弱证据推出来的时，仍然添加，不追问（只有 add 有）
@@ -116,9 +117,10 @@ stock 的值怎么写
   多 / 很少 / plenty      粗略档位，词表整套都认：无 极少 少 多 极多，英文 none few some many lots
   level2 / qty23          带前缀的写法，分别是档位与精确个数
   23                      裸数字就是精确 23 个
-  +5 / -3                 在当前的精确存量上增减，裸 + / - 就是加一减一
+  无                      就是 0 个（同一个值的两种写法，所以也能直接 +5）
+  +5 / -3                 在当前存量上增减，裸 + / - 就是加一减一
   加5 / 用掉2 / add5      同一个意思（进：加增添补进入，出：减用耗去出丢损坏）
-  当前是粗略档位时不能增减，会报错让你先写成精确数
+  只有 1-4 档的粗略存量不能增减，会报错让你先写成精确数
 
 输入技巧
   search "100 nF"        标签里带空格时用引号括起来
@@ -127,6 +129,8 @@ stock 的值怎么写
   add C 0805 100nF 多    存量可以直接写在标签里：多 / 很少 / 极少 / qty23
   add C 0805 100nF lots  同上，英文按同一架刻度：none/few/some/many/lots
   stock #7 多            改存量：档位词、裸数字、增减号都直接接在编号后面
+  add 之后问数量         元件已经入库了，答什么等于 `stock #编号 什么`，裸数字 20 也认；
+                         回车或 Ctrl+C 只是不填，元件不会撤回
   每行一条命令，不支持跨行
 
 退出
@@ -134,6 +138,7 @@ stock 的值怎么写
   Windows 控制台：Ctrl+Z 再回车
   Git Bash：Ctrl+D
   Ctrl+C 不会退出，只取消当前输入或当前操作
+  （例外：add 的数量追问处，Ctrl+C 只是跳过不填——那时元件已经入库了）
 """
 
 
@@ -205,10 +210,10 @@ def check_stock_opts(opts):
     """提前校验 --level / --qty，免得用户答完封装与数量才发现选项是错的。
 
     判定本身不在这里——make_stock 是唯一的实现，这里只是借它提前跑一遍。
-    default_coarse 让「两个都没给」照旧放过：add 允许不给存量，由追问兜底。
+    default_zero 让「两个都没给」照旧放过：add 允许不给存量，由追问兜底。
     """
     make_stock(SimpleNamespace(level=opts.get("level"), qty=opts.get("qty")),
-               default_coarse=True)
+               default_zero=True)
 
 
 # =============================================================================
@@ -238,6 +243,21 @@ def sub_ask(prompt):
 def sub_print(text):
     """追问块里的一行输出：问句、重问的提示、非法输入的抱怨。"""
     print(SUB_INDENT + text)
+
+
+def sub_print_block(text):
+    """多行文本整块缩进，空行保持空行。
+
+    有几句报错是带内嵌换行的多行文本——「看不懂存量写法」那张四行写法表、
+    「粗略档位没法做相对增减」那两行带例子的。sub_print 只在整段前面加一次缩进，
+    内嵌的换行会顶到第一列，正好破坏上面那条「缩进即追问」的规则，看起来像是
+    追问已经结束、程序自己在报错。
+
+    多行块里的相对层级要保留：那些报错的子项自带两格缩进，整块再加两格之后
+    读起来仍然是「主句 + 缩进的附表」。
+    """
+    for line in text.splitlines():
+        sub_print(line) if line else print()
 
 
 # =============================================================================
@@ -321,45 +341,6 @@ def ensure_package(tags):
         return resolve_package_answer(tags, ans)
 
 
-def ensure_stock(tags, opts):
-    """没有存量信息时问一句。返回 (要追加的存量标签或 None, 是否被取消)。
-
-    「没有存量信息」= 既没给 --level / --qty，标签里也没有 qty23 / level1 /
-    中文等级词 / 英文等级词。判断输入是否合法复用 extract_stock_tags，
-    不另写一套正则——解析规则只有一份，就在 inventory.py 里。
-    """
-    if "level" in opts or "qty" in opts:
-        return None, False
-    if extract_stock_tags(tags)[1] is not None:
-        return None, False
-    # 与 ensure_package 同样的道理：类型本身说不通时就别问了，直接交给 cmd_add
-    # 把问题一次报清楚。存量是最后一问，没必要让用户答完才看到类型错了。
-    if any(k in _TYPE_PROBLEMS for k, _ in classify_tags(tags).issues):
-        return None, False
-
-    # 同 ensure_package：问句只打一次，重问只重出输入点。
-    sub_print(STOCK_QUESTION)
-    while True:
-        try:
-            ans = sub_ask(STOCK_PROMPT).strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n已取消。")
-            return None, True
-        if not ans:
-            # 回车跳过。存量不是必需信息，每次 add 都被拦住必答会很烦。
-            return None, False
-        _, stock, issues = extract_stock_tags([ans])
-        if issues:
-            sub_print(issues[0][1])
-            continue
-        if stock is None:
-            sub_print("看不懂。请写 qty23（23 个）、level2（等级），"
-                      "或 无 / 极少 / 少 / 多 / 极多。"
-                      "英文 none / few / some / many / lots 也可以。回车跳过。")
-            continue
-        return ans, False
-
-
 def confirm_containment(relations, tags):
     """把包含关系摊开，再问要不要照加。
 
@@ -367,8 +348,7 @@ def confirm_containment(relations, tags):
     上下文，同一句话不允许出现第二份。本函数只管缩进和追问，和 do_remove 先把
     详情摊开再确认是同一个套路。
     """
-    for line in render_containment(relations, tags).splitlines():
-        sub_print(line)
+    sub_print_block(render_containment(relations, tags))
     if confirm("仍然添加？(y/N) > "):
         return True
     # 取消的结果行顶格：追问一有答案，缩进就结束，结果回到第一列。
@@ -394,6 +374,61 @@ def confirm_inference(plan, tags, stock):
     return False
 
 
+def ask_stock_after_add(comp, path):
+    """元件已经落盘之后补问一句数量。答案直接走 stock 的值语法。
+
+    与它取代的 ensure_stock 有三处根本差别：
+
+      1. **发生在写入之后**。这里没有「取消整次添加」这个选项——回车、EOF、
+         Ctrl+C 都只意味着「数量不补了」，元件留在库里、存量停在「无」。
+         数量是可选信息，不该有否决整条记录的权力。
+      2. **认的是值位置那套写法**（裸数字 23、+5、用掉2…），不是标签那套。
+         所以规则不在这儿，在 cmd_stock 里——这里一行解析都不写。
+      3. **只在值写得看不懂时重问**。写盘失败、数据文件坏了都不重问：那两种
+         重问一万次也不会好，只会把用户困在提示符里。
+
+    只读 comp.seq。不要在这里改 comp.stock——cmd_stock 自己 load_inventory，
+    手里是另一份对象，改这一份不会落盘。
+    """
+    # 同 ensure_package：问句只打一次，重问只重出输入点。
+    sub_print(STOCK_QUESTION)
+    while True:
+        try:
+            ans = sub_ask(STOCK_PROMPT).strip()
+        except (EOFError, KeyboardInterrupt):
+            # 必须自己吞 EOF：-c 分支和 inventory.py 的 main 都只捕获 AppError，
+            # 让它冒上去就是一个裸回溯——而元件其实已经加好了。
+            # input() 的提示串没有换行，补一个，和 confirm 一致。
+            print()
+            return
+        if not ans:
+            # 回车跳过。存量不是必需信息，每次 add 都被拦住必答会很烦。
+            return
+        try:
+            # 复用 cmd_stock，这样编号解析、值语法、相对增减、原子保存全都是
+            # 命令行那份实现，不会漂移；它回显的「#7  <标签>  存量: 无 → 精确 20」
+            # 也正是用户手敲同一条命令会看到的那一行。
+            cmd_stock(
+                SimpleNamespace(target=f"#{comp.seq}", value=ans,
+                                level=None, qty=None),
+                path,
+            )
+            return
+        except AppError as e:
+            # 缩进打印：这还是追问块的一部分，不是命令的结果。
+            sub_print_block(str(e))
+            if e.code != EXIT_USAGE:
+                # 写盘失败（ERROR）或数据文件坏了（DATA）。cmd_stock 的这些失败
+                # 都发生在动盘之前或写盘那一刻，答案已经没救了，重问没有意义。
+                return
+            # EXIT_USAGE = 「值写得看不懂」或「粗略档不能增减」，改一下就能过。
+        except OSError as e:
+            # save_inventory 对不可重试的 OSError 是裸抛的。不接就会冒到 repl 的
+            # 兜底 except Exception 打一整个回溯——而元件其实已经加好了。
+            sub_print_block(f"补数量失败：{e}")
+            return
+
+
 def do_add(rest, path):
     opts, tags = scan_options(rest, ADD_SPEC)
     if not tags:
@@ -411,15 +446,15 @@ def do_add(rest, path):
     if tags is None:
         return EXIT_OK  # 用户在询问处取消了，不是错误
 
-    extra, cancelled = ensure_stock(tags, opts)
-    if cancelled:
-        return EXIT_OK
-    if extra:
-        # 只是把答案拼回标签，解析交给 cmd_add——规则只有一份。
-        tags = tags + [extra]
-
-    # 复用 cmd_add，这样标签归一化、未指定存量的提示、包含关系检查、next_seq
-    # 递增、原子保存全都是命令行那份实现，不会漂移。
+    # 数量不在这里问了。以前它排在这一行（写入之前）、答案当标签拼回去，代价是
+    # 只能写字面量写法（裸数字会被拒），而且在回答处按 Ctrl+C 会把整条记录丢掉。
+    # 现在改由 ask_stock 回调在写盘之后补问，答案走 stock 的值语法。
+    #
+    # 顺序上的连带好处：类型确认与包含关系确认都排在数量之前了——那两个才是
+    # 决定「加不加」的问题，答否时不该先白答一轮数量。
+    #
+    # 复用 cmd_add，这样标签归一化、包含关系检查、next_seq 递增、原子保存
+    # 全都是命令行那份实现，不会漂移。
     #
     # SimpleNamespace 的字段形状对应 build_parser 里 add 子命令的定义。注意 cmd_add
     # 用 `args.level is None` 这样的属性访问而非 getattr，所以 level 和 qty
@@ -441,6 +476,9 @@ def do_add(rest, path):
         # 同理，又一个只由交互模式传入的确认回调——命令行没有它，弱证据推出来的
         # 类型会直接补上，那边靠回显自证。
         confirm_inference=confirm_inference,
+        # 第四个同类通道，但性质不同：它在写入**之后**才被调用，只补问一个可选
+        # 字段，不决定加不加。命令行不传，改为打印一行「未指定存量」的提示。
+        ask_stock=ask_stock_after_add,
     )
 
 

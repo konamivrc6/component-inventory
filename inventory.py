@@ -190,6 +190,12 @@ COMPOUND_EXPANSIONS = {
 TYPE_TO_DIM = {"R": "resistance", "C": "capacitance", "L": "inductance"}
 
 # 存量粗略等级的中文名，下标即等级值。
+#
+# 0 号元素是个例外：它是**录入词与显示名**，不对应任何可存储的粗略档——粗略 0
+# 在 Stock.__post_init__ 里就被折成精确 0 了（0 没有「说不清多少」的余地）。
+# 也就是说 `无` 始终能写，`STOCK_WORDS` 也照旧从本表派生（下标必须等于档位），
+# 但 `--level 0` 与 `无` 存进去的都是 {"mode": "accurate", "count": 0}，
+# 显示仍是「无」。1-4 档是真粗略档，不受影响。
 COARSE_LABELS = ("无", "极少", "少", "多", "极多")
 
 # --- 封装表 -------------------------------------------------------------------
@@ -403,7 +409,14 @@ PACKAGE_QUESTION = "请输入封装（如 0805 / SOT-23 / 5x11 / 2.54 / 直插�
 PACKAGE_PROMPT = "封装 > "
 
 # REPL 缺存量时的询问语，同样拆成问句和输入点（这句 99 列宽，更得拆）。
-STOCK_QUESTION = "请输入数量（qty23 = 23 个；或无 / 极少 / 少 / 多 / 极多，英文 none/few/some/many/lots；回车跳过）"
+#
+# 这一问发生在**元件已经入库之后**，答案走 stock 值位置那套语法（裸数字也认），
+# 所以问句里写的是裸数字而不是 `qty23`——后者是标签位置独有的写法，在这里虽然
+# 也认，但没必要让用户记。
+#
+# `+5` / `用掉2` 这类增减词刻意不写进问句：虽然改后确实能用（新元件默认是精确 0），
+# 但问句已经 90+ 列宽，而这种细节有 README 和 help 去讲。
+STOCK_QUESTION = "请输入数量（直接写数字＝精确个数，如 23；或无 / 极少 / 少 / 多 / 极多，英文 none/few/some/many/lots；回车跳过）"
 STOCK_PROMPT = "数量 > "
 
 # --- 存量标签 -----------------------------------------------------------------
@@ -1959,11 +1972,26 @@ class Stock:
     `{"coarse": 3, "accurate": null}`，是因为前者在结构层面就排除了
     「两个同时有值」和「两个同时为空」两种非法状态。设新值时整个对象被
     替换，天然满足「设置新的就顶掉旧的」，不需要记得去清空另一个字段。
+
+    零只有一个形状：粗略档的 0 在构造时就折成精确 0。
     """
 
     mode: str  # "coarse" | "accurate"
     level: int | None = None
     count: int | None = None
+
+    def __post_init__(self):
+        # 粗略档位是给「说不清具体多少个」用的，而 0 没有说不清的余地——
+        # 「大致上没有」和「精确地没有」是同一件事。存成两个形状的代价很实际：
+        # 新加的元件默认就是 0，于是 apply_stock_value 的相对增减在最常见的
+        # 那条路径上失效（`add` 完想 `+1` 必然撞报错）。
+        #
+        # 折叠放在构造函数里而不是各个解析点（extract_stock_tags / parse_stock_value
+        # / make_stock / from_dict），是为了让「0 只有一个形状」由类型本身保证，
+        # 而不是靠每个调用点都记得转换一遍。写法 `无` / `level0` / `none` 照旧认，
+        # 只是产出被折成精确 0。
+        if self.mode == "coarse" and self.level == 0:
+            self.mode, self.level, self.count = "accurate", None, 0
 
     def to_dict(self):
         if self.mode == "accurate":
@@ -1988,11 +2016,19 @@ class Stock:
         raise AppError(f"stock.mode 非法：{mode!r}（应为 coarse 或 accurate）", EXIT_DATA)
 
     def label(self):
+        # 0 显示成「无」而不是「精确 0」：表里那一列要回答的是「有没有」，
+        # 不是「算什么模式」。0 只有一种形状（见 __post_init__），所以这个
+        # 显示名不会和任何粗略档打架。
+        #
+        # list / search / 包含关系表 / add 与 stock 的回显 / 删除确认全部经本函数，
+        # 规则只有这一份——不会出现「表格里叫无、回显里叫精确 0」的分裂。
         if self.mode == "accurate":
-            return f"精确 {self.count}"
+            return f"精确 {self.count}" if self.count else COARSE_LABELS[0]
         return f"{COARSE_LABELS[self.level]}({self.level})"
 
     def is_low(self):
+        # 精确 0 走 count <= 5 这一支，与原先粗略 0 走 level <= 1 结果一致，
+        # 所以折叠零没有改变「存量偏低」的判定。
         if self.mode == "accurate":
             return self.count <= 5
         return self.level <= 1
@@ -2629,7 +2665,7 @@ def build_parser():
     return p
 
 
-def make_stock(args, default_coarse=False):
+def make_stock(args, default_zero=False):
     """从 --level / --qty 造一个 Stock。选项形态的唯一入口。
 
     范围校验收在这里而不是各调用点：argparse 的 choices 只管命令行，REPL 那边
@@ -2639,6 +2675,10 @@ def make_stock(args, default_coarse=False):
 
     两个都给时仍然由 qty 静默胜出：命令行靠 argparse 的互斥组挡住，REPL 的
     do_add 自带一段检查，两处都还在。这是既有行为，本次不动 add 那一路。
+
+    default_zero 管的是「两个选项都没给」：add 允许不给存量，那时记「无」，
+    而 stock 命令必须给一个值。参数叫 zero 而不是 coarse，是因为粗略 0 已经
+    不是一个可存储的形状了（见 Stock.__post_init__）。
     """
     qty = getattr(args, "qty", None)
     level = getattr(args, "level", None)
@@ -2649,9 +2689,13 @@ def make_stock(args, default_coarse=False):
     if level is not None:
         if not 0 <= level <= 4:
             raise AppError(f"--level 应该在 0-4 之间，实际是 {level}", EXIT_USAGE)
+        # level 0 会被 __post_init__ 折成精确 0。对用户没有影响——它显示出来
+        # 仍是「无」，与折叠之前逐字相同。
         return Stock("coarse", level=level)
-    if default_coarse:
-        return Stock("coarse", level=0)
+    if default_zero:
+        # 直接写折叠后的形状，不靠 __post_init__ 兜底：读代码的人一眼看到的就是
+        # 最终存进盘的那个值。
+        return Stock("accurate", count=0)
     raise AppError("必须指定 --level 或 --qty", EXIT_USAGE)
 
 
@@ -2721,8 +2765,13 @@ def apply_stock_value(current, token, seq):
     """把值 token 作用到当前存量上，返回新的 Stock。seq 只用来写报错里的例子。
 
     相对增减只在当前是「精确」时有意义——粗略档位没有可比的数量基准，替用户
-    猜一个基准不如要求他先写成精确数。新加的元件默认是粗略的「无(0)」，所以
-    刚 add 完就想 `+1` 的人一定会撞上这条，报错必须把下一步写清楚。
+    猜一个基准不如要求他先写成精确数。这条只对 1-4 档生效：「多」的下一格是
+    「极多」，「极少」的下一格却是「少」，中间差着的量只能靠猜。
+
+    0 不在其列。零没有说不清多少的余地，所以粗略 0 在 Stock.__post_init__ 里
+    就折成了精确 0，于是新加的元件（默认就是 0）可以直接 `+5`——那正是最常见
+    的那条路径，不该被这条守卫挡住。报错文案里的「先写成精确数」也随之只
+    在真粗略档上出现。
     """
     kind, payload = parse_stock_value(token)
     if kind == "set":
@@ -2810,7 +2859,8 @@ def cmd_search(args, path):
     return EXIT_OK if hits else EXIT_NOTFOUND
 
 
-def cmd_add(args, path, extra_package=None, confirm=None, confirm_inference=None):
+def cmd_add(args, path, extra_package=None, confirm=None, confirm_inference=None,
+            ask_stock=None):
     """添加元件。
 
     extra_package 只由交互模式传入（见 classify_tags）：命令行入口不传，
@@ -2824,9 +2874,17 @@ def cmd_add(args, path, extra_package=None, confirm=None, confirm_inference=None
     要的是不被打断，而它至少还能从回显里看到补了什么。回调返回 False 就中止
     整次添加，退出码仍是 EXIT_OK——「我问了、你不想加」不是错误。
 
+    ask_stock 是第四个，与上面三个有一处根本区别：**它在写入之后才被调用**，
+    此时元件已经落盘、comp.seq 可用，回调要做的是补问一个可选字段（数量），
+    而不是决定加不加。所以它没有返回值，也不承担「取消整次添加」的职责——
+    回车 / EOF / Ctrl+C 都只意味着「数量不补了」，元件留在库里。命令行不传，
+    改为打印一行「未指定存量，已设为 0」。
+
     三个检测都放在本函数而不是 WarehouseKeeper，一是两个入口只能有一份判定和
     一份措辞，二是它们都必须看到 classify_tags 定稿后的标签——`add 0805 100nF
     50V` 补出来的那个 C 要是赶不上，跟库里任何一条电容都比不出关系来。
+    ask_stock 的调用点同理只有一份：它挂在「没给存量」那个判定上，而那正是
+    决定 stock 取值的那一行。
     """
     inv = load_inventory(path)
     tags = []
@@ -2867,7 +2925,7 @@ def cmd_add(args, path, extra_package=None, confirm=None, confirm_inference=None
         # 发生（判定规则见 classify_tags），所以删掉的是重复信息本身，不是信息。
         tags = [t for t in tags if t not in plan.absorbed]
 
-    stock = tag_stock if tag_stock is not None else make_stock(args, default_coarse=True)
+    stock = tag_stock if tag_stock is not None else make_stock(args, default_zero=True)
 
     # --force 只在这一层读一次，本函数里两处（类型确认、包含关系）共用同一个值。
     # 它的意思是「我看过了，照加」，对两问都成立。
@@ -2907,10 +2965,15 @@ def cmd_add(args, path, extra_package=None, confirm=None, confirm_inference=None
     inv.components.append(comp)
     save_inventory(inv)
 
+    # 存量待答时，这一行先不打存量：紧接着的追问会把它改掉，先写一个「无」再改
+    # 只是噪音。最终值由回调里的 cmd_stock 给出「无 → 精确 20」那一行。
+    ask_pending = tag_stock is None and not opt_stock and ask_stock is not None
+
     # 回显用的是 comp.tags，不是上面那个局部 tags：save_inventory 刚把存盘的标签
     # 规范化过（写法规整 + 槽位重排），结果写回了 comp.tags，而局部 tags 还停在
     # 规范化之前。回显必须和用户打开 JSON 看到的那一份一致。
-    print(f"已添加 #{comp.seq}  {format_tag_line(comp.tags)}   存量: {stock.label()}")
+    echo = f"已添加 #{comp.seq}  {format_tag_line(comp.tags)}"
+    print(echo if ask_pending else f"{echo}   存量: {stock.label()}")
     # 自动补全是在改用户的数据，比匹配更需要解释自己。项目里反复强调的
     # 「模糊匹配必须能解释自己」在这里同样适用，而且这里的要求更高。
     if plan.added_type:
@@ -2921,8 +2984,17 @@ def cmd_add(args, path, extra_package=None, confirm=None, confirm_inference=None
         merged = "、".join(f"`{t}`" for t in plan.absorbed)
         print(f"  （{merged} 已并入封装 {plan.package}：这个封装本身就说明了安装方式）")
     if tag_stock is None and not opt_stock:
-        print("提示：未指定存量，已设为 0（无）。用 --level 0-4 / --qty N，"
-              "或在标签里写 多 / 很少 / qty23（英文 none / few / some / many / lots 同样认）。")
+        if ask_stock is None:
+            print("提示：未指定存量，已设为 0（无）。用 --level 0-4 / --qty N，"
+                  "或在标签里写 多 / 很少 / qty23（英文 none / few / some / many / lots 同样认）。")
+        else:
+            # 元件此刻已经在盘上了。回调内部自己 load / save 一次去改它的存量，
+            # 所以本函数从这里往下**不得再 save_inventory**——comp 是写入那一刻
+            # 的对象，它的 stock 还是「无」，再存一次会把回调刚写进去的值覆盖回去。
+            #
+            # 位置也不许上移到存盘之前：cmd_stock 是按 `#编号` 定位的，元件不在
+            # 盘上就会以「没有 #N 这个编号」失败，用户答的数量白丢。
+            ask_stock(comp, path)
 
     # --force 的意思是「我看过了，照加」，但命令行那条路上用户可能一上来就带着
     # 它，从没见过相关元件是谁。留一行痕迹。交互模式不重复打印：它刚把同一张
@@ -3217,6 +3289,23 @@ def run_selftest():
     eq(Stock.from_dict({"mode": "coarse", "level": 3}).label(), "多(3)", "粗略存量显示")
     eq(Stock.from_dict({"mode": "accurate", "count": 42}).label(), "精确 42", "精确存量显示")
     ok(Stock("coarse", level=3).to_dict() == {"mode": "coarse", "level": 3}, "存量序列化")
+
+    # --- 零只有一个形状 ---
+    # 粗略 0 在构造函数里就折成精确 0。这几条钉的是那条不变式本身：它一旦松动，
+    # 后果是 add 之后 `+1` 又开始报错（apply_stock_value 只认精确档），
+    # 而那个失败发生在离这里很远的交互路径上，不会有别的断言替你发现。
+    ok(Stock("coarse", level=0) == Stock("accurate", count=0), "粗略 0 与精确 0 是同一个值")
+    ok(Stock("coarse", level=0).to_dict() == {"mode": "accurate", "count": 0},
+       "粗略 0 存进盘的是精确 0")
+    eq(Stock("accurate", count=0).label(), "无", "精确 0 显示成「无」，不是「精确 0」")
+    ok(Stock("accurate", count=0).is_low(), "精确 0 仍是存量偏低——折叠没有改变这个判定")
+    ok(Stock.from_dict({"mode": "coarse", "level": 0}).to_dict() ==
+       {"mode": "accurate", "count": 0}, "旧数据里的粗略 0 在读盘时就被折过来")
+    # 1-4 档是真粗略档，不受牵连。
+    for _lv in (1, 2, 3, 4):
+        eq(Stock("coarse", level=_lv).to_dict(), {"mode": "coarse", "level": _lv},
+           f"粗略 {_lv} 档不该被折叠")
+    eq(Stock("coarse", level=1).label(), "极少(1)", "粗略 1 档的显示名不变")
     for bad in ({"mode": "coarse", "level": 9}, {"mode": "accurate", "count": -1}, {"mode": "x"}):
         try:
             Stock.from_dict(bad)
@@ -3760,12 +3849,19 @@ def run_selftest():
     ok(match_token("钽电容", _tan)[0] > 0, "钽电容应命中——单字不该被防护挡掉")
     ok(match_token("钽", _tan)[0] > 0, "单字 钽 也应命中同一元件")
 
+    # 0 档存进去的是精确 0 而不是粗略 0（见 Stock.__post_init__），所以下面四处
+    # 按等级列期望的地方都得过这一道。写成函数是因为「0 是精确的」这条不变式
+    # 要在四个词表里同时成立——各写一份的话，漏掉哪一个都静默放过。
+    def by_level(level):
+        return ({"mode": "accurate", "count": 0} if level == 0
+                else {"mode": "coarse", "level": level})
+
     # --- 存量标签：带前缀的数字 ---
     for raw, want in (("qty23", {"mode": "accurate", "count": 23}),
                       ("QTY23", {"mode": "accurate", "count": 23}),
                       ("level1", {"mode": "coarse", "level": 1}),
                       ("Level2", {"mode": "coarse", "level": 2}),
-                      ("level0", {"mode": "coarse", "level": 0}),
+                      ("level0", {"mode": "accurate", "count": 0}),
                       ("level4", {"mode": "coarse", "level": 4})):
         _rest, _s, _iss = extract_stock_tags(["C", "0805", raw])
         eq(_s.to_dict() if _s else None, want, f"存量标签 {raw!r}")
@@ -3781,7 +3877,7 @@ def run_selftest():
                        ("多", 3), ("不少", 3),
                        ("极多", 4), ("很多", 4), ("大量", 4)):
         _rest, _s, _iss = extract_stock_tags([raw])
-        eq(_s.to_dict() if _s else None, {"mode": "coarse", "level": level},
+        eq(_s.to_dict() if _s else None, by_level(level),
            f"等级词 {raw!r} → level {level}")
         eq(tuple(_rest), (), f"等级词 {raw!r} 应被摘掉")
         eq(tuple(_iss), (), f"等级词 {raw!r} 不该有问题")
@@ -3794,7 +3890,7 @@ def run_selftest():
     _ladder = (("none", 0), ("few", 1), ("some", 2), ("many", 3), ("lots", 4))
     for raw, level in _ladder:
         _rest, _s, _iss = extract_stock_tags([raw])
-        eq(_s.to_dict() if _s else None, {"mode": "coarse", "level": level},
+        eq(_s.to_dict() if _s else None, by_level(level),
            f"英文等级词 {raw!r} → level {level}")
         eq(tuple(_rest), (), f"英文等级词 {raw!r} 应被摘掉")
         eq(tuple(_iss), (), f"英文等级词 {raw!r} 不该有问题")
@@ -3809,7 +3905,7 @@ def run_selftest():
                        ("several", 3),
                        ("plenty", 4), ("tons", 4)):
         _rest, _s, _iss = extract_stock_tags([raw])
-        eq(_s.to_dict() if _s else None, {"mode": "coarse", "level": level},
+        eq(_s.to_dict() if _s else None, by_level(level),
            f"英文同义词 {raw!r} → level {level}")
         eq(tuple(_rest), (), f"英文同义词 {raw!r} 应被摘掉")
         eq(tuple(_iss), (), f"英文同义词 {raw!r} 不该有问题")
@@ -3818,7 +3914,7 @@ def run_selftest():
     # normalize_text 刻意不做 casefold（M 与 m 语义相反），所以这一层是单独加的。
     for raw, level in (("NONE", 0), ("None", 0), ("FEW", 1), ("MANY", 3), ("Lots", 4)):
         _rest, _s, _iss = extract_stock_tags([raw])
-        eq(_s.to_dict() if _s else None, {"mode": "coarse", "level": level},
+        eq(_s.to_dict() if _s else None, by_level(level),
            f"英文等级词大小写：{raw!r} → level {level}")
         eq(tuple(_rest), (), f"英文等级词大小写：{raw!r} 应被摘掉")
 
@@ -3925,8 +4021,16 @@ def run_selftest():
     eq(apply_stock_value(Stock("coarse", level=3), "10", 7),
        Stock("accurate", count=10), "粗略档可以被精确数覆盖")
     eq(apply_stock_value(_acc42, "多", 7), Stock("coarse", level=3), "精确档可以被档位词覆盖")
-    for _st, _tok, _label in ((Stock("coarse", level=3), "+1", "粗略档不能相对增减"),
-                              (Stock("coarse", level=0), "-", "粗略档不能相对增减"),
+
+    # 零可以直接增减——这是「0 只有一种形状」的**全部目的**。新加的元件默认就是 0，
+    # 而 add 之后想 `+1` 是最常见的下一步，不该被粗略档的守卫挡在门外。
+    eq(apply_stock_value(Stock("coarse", level=0), "+5", 7),
+       Stock("accurate", count=5), "粗略 0 已经是精确 0，可以直接加")
+    eq(apply_stock_value(Stock("accurate", count=0), "加5", 7),
+       Stock("accurate", count=5), "精确 0 加 5")
+
+    for _st, _tok, _label in ((Stock("coarse", level=1), "+1", "粗略档不能相对增减"),
+                              (Stock("coarse", level=3), "-", "粗略档不能相对增减"),
                               (Stock("accurate", count=0), "-1", "精确 0 不能再减"),
                               (Stock("accurate", count=2), "减5", "减成负数要报错")):
         _raises(lambda s=_st, t=_tok: apply_stock_value(s, t, 7), _label)
@@ -3951,8 +4055,11 @@ def run_selftest():
     # --- make_stock 的范围校验 ---
     eq(make_stock(argparse.Namespace(level=2, qty=None)), Stock("coarse", level=2), "--level 2")
     eq(make_stock(argparse.Namespace(level=None, qty=5)), Stock("accurate", count=5), "--qty 5")
-    eq(make_stock(argparse.Namespace(level=None, qty=None), default_coarse=True),
-       Stock("coarse", level=0), "add 不给存量时默认「无(0)」")
+    eq(make_stock(argparse.Namespace(level=None, qty=None), default_zero=True),
+       Stock("accurate", count=0), "add 不给存量时默认「无」——存的是精确 0，显示成无")
+    # --level 0 与「不给」落到同一个值：粗略 0 不是一种可存储的形状。
+    eq(make_stock(argparse.Namespace(level=0, qty=None)), Stock("accurate", count=0),
+       "--level 0 折成精确 0（显示仍是「无」，所以这个选项对用户没变）")
     _raises(lambda: make_stock(argparse.Namespace(level=None, qty=None)),
             "stock 没给存量时不能默默建一个——它和 add 不同")
     for _ns, _label in ((argparse.Namespace(level=5, qty=None), "--level 5 越界"),
