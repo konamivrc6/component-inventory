@@ -231,12 +231,26 @@ _PACKAGE_NONE_KEYS = frozenset({"无封装", "不适用", "nopackage", "nopkg"})
 
 # 「族名 + 数字」的封装模式。族名必须逐个列举，且后面**必须跟数字**——
 # 否则 `TOMATO` 会被 `TO` 前缀吃掉。
+#
+# 带散热焊盘的 SOP 系是**独立族名**，不和 `SOP` 混同：`ESOP-8` 底下多一块散热
+# 焊盘，立创 EDA 里也是独立封装，照着 `SOP-8` 下单会买错。`SO` 是 `SOIC` 的
+# 另一种叫法，排在最后——`SOD` / `SOT` / `SOIC` / `SOP` 都必须先于它尝试。
 _PACKAGE_FAMILY_RE = re.compile(
-    r"^(?P<fam>PDIP|DIP|SOIC|SOP|SSOP|TSSOP|MSOP|QSOP|QFN|DFN|LQFP|TQFP|QFP|"
-    r"PLCC|BGA|LGA|SOT|SOD|TO|DO|SC)"
+    r"^(?P<fam>PDIP|DIP|SOIC|SOP|ESOP|HSOP|SSOP|HSSOP|TSSOP|HTSSOP|ETSSOP|MSOP|QSOP|"
+    r"QFN|DFN|LQFP|TQFP|QFP|PLCC|BGA|LGA|SOT|SOD|TO|DO|SC|SO)"
     r"[-_ ]?(?P<num>\d[A-Za-z0-9\-]*)$",
     re.IGNORECASE,
 )
+
+# 散热焊盘的两种写法：前缀（`ESOP8`）与后缀（`SOP-8_EP`）。说的是同一件事，归到
+# 一个名字，免得同一个形状在库里长出两个。只认领 SO 系这三个族名——别的族名没有
+# 公认的 E 形式，硬造一个（`EPSOIC`）比认不出来更糟，所以剩下的原样落回族名正则。
+_EP_SUFFIX_RE = re.compile(r"^(?P<base>.+?)[-_\s]?ep$", re.IGNORECASE)
+_EP_FAMILY = {"SOP": "ESOP", "SSOP": "HSSOP", "TSSOP": "ETSSOP"}
+
+# 同一个形状在不同厂牌下的两个名字：`ESOP` 的 E 是 exposed pad，`HSOP` 的 H 是
+# heat sink，指的都是一块散热焊盘。留 E 系作规范名，H 系作别名。`SO` 同理归 `SOIC`。
+_FAMILY_ALIAS = {"HSOP": "ESOP", "HTSSOP": "ETSSOP", "SO": "SOIC"}
 
 _PACKAGE_EXACT = {}
 for _code in PACKAGE_SIZE_CODES:
@@ -313,11 +327,15 @@ def _canon_mech_package(t):
 # 时现算，反而永远和下面这张判定表保持一致。
 _MOUNT_SMD, _MOUNT_THT = "贴片", "直插"
 
-# 贴片族：除 DIP 外的全部半导体封装。
+# 贴片族：除 DIP 外的全部半导体封装。带散热焊盘的 SOP 系也在这里——它们同样是
+# 贴片，少列一个族名就会让 package_mount 返回 None，后果是搜「贴片」找不到它、
+# 冗余的 `贴片` 标签也不再被吸收。别名（`hsop` / `htssop`）一并列上，这样直答
+# 未归一的封装名时也判得出安装方式。
 _MOUNT_SMD_PACKAGES = frozenset({
     "qfn", "dfn", "bga", "lga", "plcc", "melf", "dpak", "d2pak", "toll",
-    "sma", "smb", "smc", "ll34", "soic", "sop", "ssop", "tssop", "msop",
-    "qsop", "lqfp", "tqfp", "qfp", "sot", "sod", "sc",
+    "sma", "smb", "smc", "ll34", "soic", "sop", "esop", "hsop", "ssop",
+    "hssop", "tssop", "htssop", "etssop", "msop", "qsop", "lqfp", "tqfp",
+    "qfp", "sot", "sod", "sc",
 })
 _MOUNT_THT_PACKAGES = frozenset({"dip", "pdip"})
 
@@ -967,10 +985,25 @@ def canon_package(token):
     mech = _canon_mech_package(t)
     if mech is not None:
         return mech
+
+    # 散热焊盘的后缀写法必须排在族名正则**之前**试：`SOP8-EP` 会被下面 num 段
+    # （`\d[A-Za-z0-9\-]*`，允许连字符）吃成 `SOP-8-EP`，先撞上就再也还原不回来。
+    ep = _EP_SUFFIX_RE.match(t)
+    if ep is not None:
+        base = canon_package(ep["base"])
+        mb = _PACKAGE_FAMILY_RE.match(base) if base else None
+        fam = _EP_FAMILY.get(mb["fam"].upper()) if mb else None
+        if fam:
+            return f"{fam}-{mb['num']}"
+        # 不是 SO 系的 `_EP`：**不认领**，原样落下走族名正则。这条 fall-through
+        # 是必须的——`QFN32-EP` / `SOIC-8-EP` / `SOD-123EP` 这些今天都是合法封装
+        # （被 num 段当成多段编号收下），在这儿返回 None 会一起把它们弄丢。
+
     m = _PACKAGE_FAMILY_RE.match(t)
-    if m:
-        return f"{m['fam'].upper()}-{m['num']}"
-    return None
+    if m is None:
+        return None
+    fam = _FAMILY_ALIAS.get(m["fam"].upper(), m["fam"].upper())
+    return f"{fam}-{m['num']}"
 
 
 @lru_cache(maxsize=None)
@@ -1359,12 +1392,20 @@ def classify_tags(tags, extra_package=None):
     # 让用户看见；`直插 18650` 也不吸收，因为 18650 派生不出安装方式，那个标签
     # 还有信息量。
     #
+    # 能被吸收的只有两种：安装方式词本身（`贴片 0805` 里的 `贴片`），以及**同一个
+    # 封装被写了两遍**（`5x11mm` + `5x11`，归一后是同一个键）。只比安装方式是不够
+    # 的——`SOIC-8` 和 `TSSOP-16` 都是贴片，但它们是两个不同的封装，按安装方式判
+    # 会把后一个当成冗余静默删掉，用户看不见自己少写了一条信息。
+    #
     # 这里只**报告**该吸收谁，真正的删除在 cmd_add 里做：本函数始终只读，自检里
     # 有断言钉着这条。
     mount = package_mount(package) if package else None
     absorbed = ()
     if mount is not None:
-        absorbed = tuple(p for p in packages[1:] if package_mount(p) == mount)
+        absorbed = tuple(p for p in packages[1:]
+                         if package_mount(p) == mount
+                         and (_package_rank(p) == 0
+                              or _pkg_key(p) == _pkg_key(package)))
 
     return TagPlan(
         type_code=type_code,
@@ -3527,6 +3568,7 @@ def run_selftest():
                       ("SOT-23", "SOT-23"), ("SOT23", "SOT-23"), ("sot 23", "SOT-23"),
                       ("DIP-8", "DIP-8"), ("dip8", "DIP-8"), ("PDIP-8", "PDIP-8"),
                       ("SOIC-14", "SOIC-14"), ("TSSOP-16", "TSSOP-16"),
+                      ("SOP-8", "SOP-8"), ("SOP8", "SOP-8"),
                       ("QFN-32", "QFN-32"), ("LQFP-48", "LQFP-48"),
                       ("TO-220", "TO-220"), ("DO-41", "DO-41"),
                       ("SOD-123", "SOD-123"), ("SC-70", "SC-70"),
@@ -3534,6 +3576,30 @@ def run_selftest():
                       ("贴片", "贴片"), ("SMD", "贴片"), ("直插", "直插"), ("THT", "直插"),
                       ("NO PACKAGE", "无封装"), ("no package", "无封装"), ("无封装", "无封装")):
         eq(canon_package(raw), want, f"封装识别 {raw!r}")
+
+    # --- 封装识别：带散热焊盘的 SOP 系 ---
+    # `ESOP8` 曾经整族认不出来，最后以「没有找到封装标签」的形式报给用户——这个
+    # 形状的错法是**静默落进残差槽**，所以正例要齐。
+    #
+    # E 是 exposed pad、H 是 heat sink，两个名字说的是同一块散热焊盘，归到一个
+    # 规范名；后缀 `_EP` 与前缀是同一件事的两种写法，也归过去。散热焊盘是独立
+    # 封装——`ESOP-8` 与 `SOP-8` 不能互换，照着后者下单会买错，所以不合并。
+    for raw, want in (("ESOP8", "ESOP-8"), ("ESOP-8", "ESOP-8"), ("esop8", "ESOP-8"),
+                      ("HSOP8", "ESOP-8"), ("HTSSOP16", "ETSSOP-16"),
+                      ("ETSSOP16", "ETSSOP-16"), ("HSSOP28", "HSSOP-28"),
+                      ("SOP-8_EP", "ESOP-8"), ("SOP8_EP", "ESOP-8"),
+                      ("SOP8-EP", "ESOP-8"), ("SOP-8EP", "ESOP-8"),
+                      ("TSSOP-16_EP", "ETSSOP-16"), ("SSOP-28_EP", "HSSOP-28")):
+        eq(canon_package(raw), want, f"散热焊盘封装 {raw!r} 应归一到 {want!r}")
+    # `SO-8` 是 `SOIC-8` 的另一种叫法，不能再长出第三种写法。
+    for raw in ("SO8", "SO-8", "SO 8"):
+        eq(canon_package(raw), "SOIC-8", f"{raw!r} 是 SOIC-8 的别名")
+    # 后缀分支**只认领 SO 系**。下面这几个今天靠 num 段当多段编号收下，是合法
+    # 封装；认领就会把 `QFN32-EP` 从 `QFN-32-EP` 变成 None，反而弄丢东西。
+    for raw, want in (("QFN32-EP", "QFN-32-EP"), ("SOIC-8-EP", "SOIC-8-EP"),
+                      ("SOD-123EP", "SOD-123EP"), ("DIP8EP", "DIP-8EP"),
+                      ("SC70-EP", "SC-70-EP")):
+        eq(canon_package(raw), want, f"{raw!r} 不是 SOP 系的 _EP，应原样落下")
 
     # --- 机械尺寸：正例 ---
     # 这一类和上面靠查表的不同，形态是正则匹配，所以单列一组。
@@ -3574,6 +3640,11 @@ def run_selftest():
         ok(canon_package(raw) is None, f"{raw!r} 不应被识别为封装")
     # `TOMATO` 必须躲开 `TO` 前缀——这就是族名后面强制要求数字的原因
     ok(canon_package("TOMATO") is None, "TOMATO 不应被 TO 前缀吃掉")
+    # 刻意不支持的写法也要钉住，免得日后被当成漏掉的 case 顺手放宽：`SO` 是
+    # `SOIC` 的别名但裸 `SO` 不是封装；下划线形式的 `_EP` 只有 SO 系认（别的
+    # 族名没有公认的 E 形式，硬造一个 `EPSOIC` 比认不出来更糟）。
+    for raw in ("ESOIC8", "SOIC-8_EP", "SO"):
+        ok(canon_package(raw) is None, f"{raw!r} 刻意不支持，必须仍是 None")
 
     # --- 类型推断：正例 ---
     def tcode(tags):
@@ -3723,6 +3794,13 @@ def run_selftest():
     eq(classify_tags(["C", "直插", "0805", "100nF"]).absorbed, (), "直插 + 0805 自相矛盾，不吸收")
     eq(classify_tags(["BAT", "直插", "18650"]).absorbed, (), "18650 派生不出安装方式，不吸收")
     eq(classify_tags(["C", "贴片", "100nF", "50V"]).absorbed, (), "没有落选者就没有可吸收的")
+    # 两个**不同的**真封装不算冗余。只比安装方式是不够的：`SOIC-8` 和 `TSSOP-16`
+    # 都是贴片，按安装方式判会把后一个当成冗余静默删掉，用户看不见自己少写了一
+    # 条信息。能吸收的只有安装方式词本身，以及同一个封装被写了两遍。
+    eq(classify_tags(["U", "SOIC-8", "TSSOP-16"]).absorbed, (), "两个不同封装不互相吸收")
+    eq(classify_tags(["U", "SOIC-8", "TSSOP-16"]).package, "SOIC-8", "同级取书写靠前的那个")
+    eq(classify_tags(["U", "贴片", "ESOP8"]).absorbed, ("贴片",), "散热焊盘封装也派生得出贴片")
+    eq(classify_tags(["U", "贴片", "ESOP8"]).package, "ESOP-8", "ESOP8 就是它的封装")
     # 吸收只报告、不执行——classify_tags 必须是纯读的，删除动作在 cmd_add 里。
     _ts = ["C", "直插", "5x11"]
     classify_tags(_ts)
@@ -3731,6 +3809,7 @@ def run_selftest():
     # --- 安装方式判定 ---
     for pkg, want in (("0805", "贴片"), ("0603", "贴片"), ("DIP-8", "直插"),
                       ("PDIP-8", "直插"), ("SOT-23", "贴片"), ("SOIC-14", "贴片"),
+                      ("ESOP-8", "贴片"), ("ETSSOP-16", "贴片"), ("HSSOP-28", "贴片"),
                       ("TO-220", "直插"), ("TO-92", "直插"), ("TO-252", "贴片"),
                       ("DO-41", "直插"), ("DO-35", "直插"), ("Case A", "贴片"),
                       ("2.54", "直插"), ("5.08", "直插"), ("5mm", "直插"),
@@ -3766,6 +3845,20 @@ def run_selftest():
                     stock=Stock("coarse", level=0))
     ok(match_token("SOT23", _c4)[0] > 0, "搜 SOT23 应命中 SOT-23")
     ok(match_token("sot 23", _c4)[0] > 0, "带空格的分隔写法同样要能命中")
+
+    # --- 散热焊盘封装：同一件事的多种写法要互相搜到 ---
+    _c6 = Component(id="u", seq=6, tags=["U", "TP5400", "SOP-8_EP"],
+                    stock=Stock("coarse", level=0))
+    ok(match_token("ESOP-8", _c6)[0] > 0, "搜 ESOP-8 应命中写成 SOP-8_EP 的元件")
+    _c7 = Component(id="v", seq=7, tags=["U", "TP5400", "ESOP8"],
+                    stock=Stock("coarse", level=0))
+    ok(match_token("ESOP-8", _c7)[0] > 0, "搜 ESOP-8 应命中写成 ESOP8 的元件")
+    ok(match_token("HSOP8", _c7)[0] > 0, "H 系与 E 系合流，搜 HSOP8 也要命中")
+    ok(match_token("贴片", _c7)[0] > 0, "散热焊盘封装派生得出贴片，搜贴片要命中")
+    # 反过来 `SOP-8` 与 `ESOP-8` 是两个形状，不该互相命中。注意这只对**不带
+    # `_EP` 后缀**的记录成立：`SOP-8` 恰好是 `SOP-8_EP` 的字面前缀，会走子串层
+    # 拿一个 0.5 档的弱命中，那是子串召回本身的行为，不是封装归约层放的水。
+    eq(match_token("SOP-8", _c7)[0], 0.0, "SOP-8 与 ESOP-8 是两个形状，不该互相命中")
 
     # --- 带单位的机械尺寸：两种写法要互相搜到 ---
     # 这是真实数据里踩到的坑：`5x11mm` 漏认 → 被追问封装 → 标签里留下两份尺寸。
