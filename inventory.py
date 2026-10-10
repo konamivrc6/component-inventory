@@ -119,6 +119,14 @@ TYPE_ALIASES = {
     # 判成电阻），加 `s` 只是把暴露面扩大一个字母；含数字的型号（SS34、S8050）不受
     # 影响，分词带残余回退，整段退回原 token。
     "SW": ("开关", "switch", "按键", "轻触开关", "按钮", "拨动开关", "s"),
+    # 编码器是数字脉冲器件，和 SW（开关）不是一回事：EC11 虽然大多带按压开关，
+    # 本体却是增量式旋转编码器。`编码器` 走别名表（强度 3，与 `开关`→`SW` 同样的
+    # 待遇），所以单独写 `编码器` 就是显式声明类型，REPL 不会再多问一句。
+    #
+    # 代价与当年补 `s` 同族：`ec` 随规范码进 VOCAB 分词表，`ECC` 这类纯字母标签
+    # 会被最大匹配切成 `EC` + `C` 而判成 EC（`SEC` / `REC` 会判成 SW / R）。含数字
+    # 的型号不受影响——分词带残余回退，整段退回原 token 交给型号表。
+    "EC": ("编码器", "旋转编码器", "encoder"),
     "XTAL": ("晶振", "晶体", "谐振器", "crystal", "resonator"),
     "LED": ("发光二极管", "led", "指示灯", "灯珠"),
     "OPTO": ("光耦", "光电耦合器", "optocoupler"),
@@ -551,6 +559,11 @@ PARTNO_PATTERNS = (
     (re.compile(r"^(?:HT|ME|XC|SGM)\d{3,}"), "U"),          # 常见 LDO 厂牌
     (re.compile(r"^(?:TDA|TEA)\d{3,}"), "U"),               # 音频功放
     (re.compile(r"^WS\d{4}"), "LED"),                       # WS2812
+    # 旋转编码器（Alps EC11 / EC12 系列）：`EC` 紧随机型数字，后面可再跟字母数字
+    # （EC11 / EC12 / EC11S / EC12B / EC11E15244B1）。**必须有数字**——`EC` 后紧跟
+    # 数字才算，所以 `ECC` 这类纯字母标签不走这条路。两端锚定，`EC11-20` 不吃。
+    # 大小写敏感与全表一致：型号才有大小写语义，小写 `ec11` 认不出。
+    (re.compile(r"^EC\d+[A-Z0-9]*$"), "EC"),
     # 连接器系列不在这里——它走下面单独的 _connector_series，理由见那里。
 )
 
@@ -1550,7 +1563,7 @@ def resolve_package_answer(tags, answer):
     return tags + [answer], answer
 
 
-_TYPE_HINT = "C R L D Q U J SW XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X"
+_TYPE_HINT = "C R L D Q U J SW EC XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X"
 
 # 自动补全类型时，用来向用户说明推断依据的短语。
 _SOURCE_LABEL = {
@@ -3170,6 +3183,10 @@ def run_selftest():
 
     # --- 别名表健康度 ---
     ok(not _ALIAS_CONFLICTS, f"类型别名表存在冲突：{_ALIAS_CONFLICTS}")
+    # 「可用类型码」提示是与 TYPE_ALIASES 并列的第二份手写清单，两处没有任何自动
+    # 同步。少了这一条，新加的类型码在「无法确定元件类型」的提示里会一直看不见。
+    eq(set(_TYPE_HINT.split()), set(TYPE_ALIASES),
+       "「可用类型码」提示必须与 TYPE_ALIASES 完全一致")
 
     # --- 电容等价：用户给的核心需求 ---
     for t in ("100nF", "0.1uF", "1e-7F", "100NF", "100nf", "100n"):
@@ -3656,7 +3673,9 @@ def run_selftest():
                        (["10k"], "R"), (["1M"], "R"), (["4k7"], "R"), (["1K22"], "R"),
                        (["100p"], "C"),
                        (["1N4148"], "D"), (["2N2222"], "Q"), (["SS34"], "D"),
-                       (["PC817"], "OPTO"), (["NE555"], "U"), (["STM32F103"], "U")):
+                       (["PC817"], "OPTO"), (["NE555"], "U"), (["STM32F103"], "U"),
+                       (["EC11"], "EC"), (["EC12"], "EC"), (["EC11S"], "EC"),
+                       (["EC"], "EC"), (["编码器"], "EC"), (["旋转编码器"], "EC")):
         eq(tcode(tags), want, f"类型推断 {tags}")
 
     # --- 类型推断：负例（这一组是误判防线，最重要）---
@@ -3669,7 +3688,8 @@ def run_selftest():
                  ["4u7"], ["2u2"], ["1u"], ["10u"],  # µ 前缀真实歧义
                  ["100n"], ["4n7"],                 # n 前缀同样两可：nF 与 nH 都常见
                  ["1m"],                            # mΩ / mH / mF 三可
-                 ["16V"], ["50V"], ["2W"]):         # 维度指向不了唯一类型
+                 ["16V"], ["50V"], ["2W"],          # 维度指向不了唯一类型
+                 ["ec11"], ["EC11-20"]):            # 型号表大小写敏感、且两端锚定
         eq(tcode(tags), None, f"{tags} 不应推断出类型")
     eq(tcode(["470k"]), "R", "小写 k 应正常推断为 R")
     ok(classify_tags(["4u7", "0603"]).has("micro_ambiguous"), "4u7 应报 µ 歧义")
@@ -3749,6 +3769,23 @@ def run_selftest():
                       ("MOC3021", "OPTO"), ("6N137", "OPTO"), ("4N25", "OPTO"),
                       ("WS2812", "LED"), ("XH2.54", "J"), ("VH3.96", "J")):
         eq(tcode([tag]), want, f"型号表 {tag}")
+
+    # --- 旋转编码器 EC ---
+    # 型号形态是「EC + 数字 + 可选字母数字尾巴」，走型号表（强度 2）；中文别名走
+    # 别名表（强度 3，显式）。两条路的结果不一样，所以两条都钉住：走型号表时
+    # added_type 生效、`EC` 会被补进标签；走别名表则已经是显式类型，不补也不问。
+    _ec = classify_tags(["EC11", "20mm", "qty2", "直插"])
+    eq(_ec.type_code, "EC", "EC11 应推出编码器")
+    eq(_ec.type_source, "partno", "EC11 的来源应是型号表，不能被别名那条路截走")
+    eq(_ec.added_type, "EC", "型号表推出来的类型要能补进标签")
+    eq(_ec.package, "直插", "直插已经满足封装要求")
+    eq(_ec.issues, (), "EC11 20mm qty2 直插 不该再报任何问题")
+    eq(tcode(["20mm"]), None, "20mm 仍是自由标签，不参与类型判定")
+    eq(classify_tags(["编码器", "直插"]).type_source, "explicit",
+       "编码器 是显式类型，不该走弱证据确认")
+    # 已知代价：`ec` 随规范码进了 VOCAB，`EC` + 单个规范码字母会被最大匹配切开
+    # （`ECC` → `EC` + `C`），与 `SR` / `LS` 被切段同族。真库里没有这类标签。
+    eq(canon_type("ECC"), "EC", "ECC 被判成 EC 是分词切段的已知代价，非回归")
 
     # --- 中文描述性词 ---
     eq(tcode(["直插", "5mm", "红"]), "LED", "颜色词应指向 LED")

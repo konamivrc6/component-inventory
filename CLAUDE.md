@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 电子元件库存管理 CLI。**纯标准库、无第三方依赖、无构建步骤、无 lint / formatter 配置**，改完直接跑。Python 3.14.6。
 
-`README.md`（870 行）是**权威规格**，中文写成，从命令用法到模糊识别的每一条规则都记了。本文件只写 README 里没有、或者要读好几个文件才能拼出来的东西。两者冲突时以实际行为为准，并把 README 一起改掉——这个仓库的 README 是活文档，用户自己一直在做代码与文档的同步演进，不要留下「文档说的和代码做的不一样」的状态。
+`README.md`（876 行）是**权威规格**，中文写成，从命令用法到模糊识别的每一条规则都记了。本文件只写 README 里没有、或者要读好几个文件才能拼出来的东西。两者冲突时以实际行为为准，并把 README 一起改掉——这个仓库的 README 是活文档，用户自己一直在做代码与文档的同步演进，不要留下「文档说的和代码做的不一样」的状态。
 
 ## 数据文件
 
@@ -25,7 +25,7 @@ python WarehouseKeeper.py               # 交互式 REPL
 python WarehouseKeeper.py -c "search 0.1uF"   # 不进入循环，退出码就是那条命令的结果
 ```
 
-**没有单测可以挑。** `run_selftest()` 是一个整体函数、902 项断言（`ok` / `eq` / `close` / `same` / `val` / `dim` / `_raises` 这些局部断言助手），没有过滤参数。要单独验一条规则，直接 import 模块调函数——注意 **`python -I` 会失败**，因为 `sys.path[0]` 得是仓库根目录：
+**没有单测可以挑。** `run_selftest()` 是一个整体函数、958 项断言（`ok` / `eq` / `close` / `same` / `val` / `dim` / `_raises` 这些局部断言助手），没有过滤参数。要单独验一条规则，直接 import 模块调函数——注意 **`python -I` 会失败**，因为 `sys.path[0]` 得是仓库根目录：
 
 ```bash
 cd T:/component-inventory && python -c "import inventory as inv; print(inv.canon_unit('51r'))"
