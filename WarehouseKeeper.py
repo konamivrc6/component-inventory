@@ -513,18 +513,18 @@ def do_stock(rest, path):
 def do_list(rest, path):
     opts, _ = scan_options(rest, LIST_SPEC)
     inv = get_inv(path)
+    low = bool(opts.get("low"))
     comps = sorted(inv.components, key=lambda c: c.seq)
-    if opts.get("low"):
+    if low:
         comps = [c for c in comps if c.stock.is_low()]
-    # 和 do_search 一样，校验排在空结果的提前返回之前。
+    # 和 do_search 一样，校验排在渲染之前：`-n 0` 是用法错误，不该被「反正没东西
+    # 可显示」提前吞掉。
     page, _total, note = apply_limit(comps, opts.get("limit", PAGE), "list",
-                                     bool(opts.get("low")), opts.get("all", False))
+                                     low, opts.get("all", False))
 
-    if not comps:
-        print("没有存量偏低的元件。" if opts.get("low") else "库存为空。")
-        return EXIT_OK
-
-    render_components(page)
+    # 空结果那句话由 render_components 出。原先这里自己判一次、命令行那边一律说
+    # 「库存为空」，同一件事有两种说法，且命令行那句在 --low 下是错的。
+    render_components(page, low)
     if note:
         print(note)
     return EXIT_OK

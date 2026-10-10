@@ -2575,9 +2575,16 @@ def render_hits(hits, show_reason=True):
     print(f"\n共 {len(hits)} 条")
 
 
-def render_components(components):
+def render_components(components, low=False):
+    """列表渲染，空结果的那句话也归这里。
+
+    low 是「这份列表是 --low 筛过的吗」。空且 low 时说「没有存量偏低的元件」，
+    否则说「库存为空」——这两句的差别是**事实**上的差别，不是两个入口的措辞偏好：
+    库里有货只是都不偏低，和库里什么都没有，是两回事。原先只有交互模式分得清，
+    命令行那边一律说「库存为空」，那是骗人的，所以这份判定收进来由两个入口共用。
+    """
     if not components:
-        print("库存为空。")
+        print("没有存量偏低的元件。" if low else "库存为空。")
         return
     rows = [
         ((f"#{c.seq}",), tuple(c.tags), (f"存量: {c.stock.label()}",))
@@ -3121,7 +3128,7 @@ def cmd_list(args, path):
                    "results": [component_to_json(c) for c in page]}
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        render_components(page)
+        render_components(page, args.low)
         if note:
             print(note)
     return EXIT_OK
