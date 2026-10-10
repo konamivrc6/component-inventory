@@ -38,15 +38,18 @@ python inventory.py --search 51R
 ### search —— 检索
 
 ```
-inventory.py search 查询词... [-A|--any] [-n N] [--json]
+inventory.py search 查询词... [-A|--any] [-a|--all] [-n N] [--json]
 ```
 
 多个查询词之间是 **AND**：元件必须为每个词都提供命中。`-A/--any` 放宽为「任一命中」。
+
+`-a/--all` 不分页，列出全部（等价于不给 `-n`；两个同时给时 `-n` 被忽略）。
 
 ```powershell
 python inventory.py --search 51R
 python inventory.py --search 电容 100nF      # 同时是电容且有 100nF
 python inventory.py --search 51R -n 5        # 最多 5 条
+python inventory.py --search 51R -a          # 不分页，一次看完
 python inventory.py --search 51R --json      # 供脚本消费
 python inventory.py --search 电容 电阻 -A     # 任一命中
 ```
@@ -157,14 +160,16 @@ python inventory.py stock '#7' --level 2  # 选项形式照旧
 ### list —— 列出全部
 
 ```
-inventory.py list [-n N] [--low] [--json]
+inventory.py list [-n N] [-a|--all] [--low] [--json]
 ```
 
 `--low` 只列出存量偏低的（粗略 0-1，或精确 ≤ 5）。
 
+`-a/--all` 不分页，列出全部——与 `search` 上的是同一个开关，语义也一样：等价于不给 `-n`，两个同时给时 `-n` 被忽略。命令行上 `list` 本来就不给 `-n` 就全列，所以 `-a` 在这边是显式的同义写法；真正需要它的是交互模式，那边的 `list` 默认每页 20 条。`--low` 与 `-a` 并存时正常，`-a` 只是取消分页，不改变 `--low` 的筛选。
+
 有备注的元件，会在它那一行下面缩进补一行 `备注: ...`；`--json` 结果里也带 `note` 字段。
 
-`-n` 的规则与 `search` 一致：只切显示、须为正整数、切掉了会说明实际有多少条。给了 `--low` 时那几个字会跟着变，免得读成「库里有这么多条」、或者被引去看全集：
+`-n` 的规则与 `search` 一致：只切显示、须为正整数、切掉了会说明实际有多少条。给了 `--low` 时那几个字会跟着变，免得读成「库里有这么多条」、或者被引去看全集。给了 `-a` 就不切页，这一行说明也不会出现：
 
 ```powershell
 > python inventory.py list --low -n 1
@@ -192,6 +197,7 @@ inventory.py remove #编号
 python inventory.py --search 51R     # 等价于 inventory.py search 51R
 python inventory.py --add C 100nF --level 1
 python inventory.py --list
+python inventory.py --list -a        # -a 也能跟着走：等价于 inventory.py list -a
 ```
 
 ---
@@ -204,7 +210,9 @@ python WarehouseKeeper.py
 
 进入一个循环，敲命令、看结果、再敲，不必每条命令重新起一次进程。
 
-交互模式里 `search` 与 `list` 默认每页 20 条（`-n` 可改），切掉了会补一行说明。命令行那边不给 `-n` 就是全列——它还要给管道和 `--json` 用，默认截断会静默改变脚本拿到的东西。
+交互模式里 `search` 与 `list` 默认每页 20 条（`-n` 可改），切掉了会补一行说明。命令行那边不给 `-n` 就是全列——它还要给管道和 `--json` 用，默认截断会静默改变脚本拿到的东西。交互模式想一次看完就加 `-a`（`-a, --all` 不分页），命令行加它是同一个意思，只是那边本来就默认全列。
+
+`-a` 与 `search` 上的 `-A` 只差大小写，别敲混：`-A` 放宽检索为「任一命中」，`-a` 取消分页。两个入口都大小写敏感，敲错了不会静默串到另一个意思上。
 
 ```
 元件库存  ·  交互模式

@@ -81,9 +81,11 @@ STOCK_SPEC = {"--level": ("level", int), "--qty": ("qty", int)}
 SEARCH_SPEC = {
     "-A": ("any", None), "--any": ("any", None),
     "-n": ("limit", int), "--limit": ("limit", int),
+    "-a": ("all", None), "--all": ("all", None),
 }
 LIST_SPEC = {
     "-n": ("limit", int), "--limit": ("limit", int),
+    "-a": ("all", None), "--all": ("all", None),
     "--low": ("low", None),
 }
 
@@ -94,7 +96,7 @@ HELP_TEXT = """\
   add    标签...                 添加元件（缺封装会先问你；没给数量的先按「无」入库，随后再问一句；
                                  类型能推断的会自动补；与已有元件重复时会确认）
   stock  #编号 [值]              更改存量（值可以直接写：多 / plenty / 23 / +5）
-  list                           列出全部（--low 只看存量偏低的）
+  list                           列出全部（--low 只看存量偏低的；-a 不分页）
   remove #编号                   删除元件（会二次确认）
   help                           显示本帮助
   selftest                       跑一遍 inventory.py 的内置自检
@@ -108,6 +110,8 @@ HELP_TEXT = """\
   --force         与库中元件重复或包含、或类型是弱证据推出来的时，仍然添加，不追问（只有 add 有）
   -A, --any       检索时放宽为「任一命中」，默认是全部命中
   -n N            最多显示 N 条（默认 20；须为正整数）
+  -a, --all       不分页，列出全部（等价于不给 -n；与 -n 同时给时 -n 被忽略）
+                  注意 -A 与 -a 是大小写不同的两个开关：-A 放宽检索，-a 取消分页
 
 目标怎么写
   #7              永久编号为 7 的元件。编号只增不减，删除后不回收
@@ -125,6 +129,7 @@ stock 的值怎么写
 输入技巧
   search "100 nF"        标签里带空格时用引号括起来
   search 电容 -A         任一命中
+  list -a                不分页，一次看完（search 同理）
   add R 0603 -- -40~85C  标签以 - 开头且与选项同名时，用 -- 转义
   add C 0805 100nF 多    存量可以直接写在标签里：多 / 很少 / 极少 / qty23
   add C 0805 100nF lots  同上，英文按同一架刻度：none/few/some/many/lots
@@ -289,7 +294,8 @@ def do_search(rest, path):
     hits = search_components(inv.components, words, any_mode=opts.get("any", False))
     # apply_limit 排在空结果分支之前：`-n 0` 是用法错误，不该被「反正没东西可显示」
     # 提前吞掉，否则这一条与命令行那边的校验时机就不一致了。
-    page, _total, note = apply_limit(hits, opts.get("limit", PAGE), "search")
+    page, _total, note = apply_limit(hits, opts.get("limit", PAGE), "search",
+                                     all=opts.get("all", False))
     if not hits:
         print("没有匹配的元件。")
         print("提示：加 -A 放宽为「任一命中」；用 list 看全部；用 #序号 直接定位。")
@@ -512,7 +518,7 @@ def do_list(rest, path):
         comps = [c for c in comps if c.stock.is_low()]
     # 和 do_search 一样，校验排在空结果的提前返回之前。
     page, _total, note = apply_limit(comps, opts.get("limit", PAGE), "list",
-                                     bool(opts.get("low")))
+                                     bool(opts.get("low")), opts.get("all", False))
 
     if not comps:
         print("没有存量偏低的元件。" if opts.get("low") else "库存为空。")

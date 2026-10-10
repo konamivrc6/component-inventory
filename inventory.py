@@ -2520,8 +2520,8 @@ _PAGE_WORDS = {
 }
 
 
-def apply_limit(items, limit, command, low=False):
-    """`-n` 的全部规则：切页、报总数、说明切了什么。
+def apply_limit(items, limit, command, low=False, all=False):
+    """`-n` 与 `-a` 的全部规则：切页、报总数、说明切了什么。
 
     返回 (要显示的那一页, 切片前的总数, 说明行或 None)。总数跟着切片一起返回，
     是为了让安全写法成为最省事的写法：只要调用方各自 len() 一次，迟早有人拿截断
@@ -2532,9 +2532,17 @@ def apply_limit(items, limit, command, low=False):
     「最多显示 N 条」，而空切片还会让 cmd_search 把「有匹配却一条没显示」误判成
     「未找到」（退出码 3，正是 README 教你用来判断库里有没有的那个码）。
 
+    all 是 `-a/--all`：它等价于**不给 -n**，所以折在 `-n` 的校验之前——`-a -n 0`
+    不报错，`-n` 整条被当作没写。规则只住在这里，四个调用点（命令行的 search 与
+    list、交互模式的 do_search 与 do_list）只把开关透传进来，不各自写一遍
+    「limit = None if all else limit」。折成 None 之后走下面那条提前返回，
+    因此 _PAGE_WORDS 不需要为 -a 添键，也不会 KeyError。
+
     校验放在这里而不是 argparse 的 type=，因为交互模式不走 argparse：写进 type=
     这条规则就又变成两份，那正是要消灭的东西。
     """
+    if all:
+        limit = None
     if limit is not None and limit <= 0:
         raise AppError(f"-n 应该是正整数，实际是 {limit}", EXIT_USAGE)
     if limit is None or limit >= len(items):
@@ -2637,6 +2645,9 @@ ARG_ALIASES = {
 
 _GLOBAL_OPTS_WITH_VALUE = {"--file", "-f"}
 
+# `-a/--all` 在 search 与 list 上是同一件事，措辞也只有这一份。
+_ALL_HELP = "不分页，列出全部（等价于不给 -n；与 -n 同时给时 -n 被忽略）"
+
 
 def normalize_argv(argv):
     """把 `--search X` 重写成 `search X`，让两种写法共用同一份实现。
@@ -2695,6 +2706,7 @@ def build_parser():
     ps.add_argument("query", nargs="+", help="查询词，多个词之间是「全部命中」")
     ps.add_argument("-A", "--any", action="store_true", help="放宽为「任一命中」")
     ps.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条（须为正整数）")
+    ps.add_argument("-a", "--all", action="store_true", help=_ALL_HELP)
     ps.add_argument("--json", action="store_true", help="输出 JSON")
 
     pa = sub.add_parser("add", parents=[sub_common], help="添加元件")
@@ -2719,6 +2731,7 @@ def build_parser():
 
     pl = sub.add_parser("list", parents=[sub_common], help="列出全部元件")
     pl.add_argument("-n", "--limit", type=int, metavar="N", help="最多显示 N 条（须为正整数）")
+    pl.add_argument("-a", "--all", action="store_true", help=_ALL_HELP)
     pl.add_argument("--low", action="store_true", help="只列出存量偏低的")
     pl.add_argument("--json", action="store_true", help="输出 JSON")
 
@@ -2905,7 +2918,7 @@ def cmd_search(args, path):
 
     hits = search_components(inv.components, tokens, any_mode=args.any)
     # 退出码与 total 都看 hits，只有渲染看 page：`-n` 切的是显示，不是事实。
-    page, total, note = apply_limit(hits, args.limit, "search")
+    page, total, note = apply_limit(hits, args.limit, "search", all=args.all)
 
     if args.json:
         payload = {
@@ -3101,7 +3114,7 @@ def cmd_list(args, path):
     comps = sorted(inv.components, key=lambda c: c.seq)
     if args.low:
         comps = [c for c in comps if c.stock.is_low()]
-    page, total, note = apply_limit(comps, args.limit, "list", args.low)
+    page, total, note = apply_limit(comps, args.limit, "list", args.low, args.all)
 
     if args.json:
         payload = {"count": len(page), "total": total,
@@ -3332,7 +3345,8 @@ def run_selftest():
     #
     # 这组钉的是「切页、报总数、说明切了什么」那一条规则。四个调用点（命令行的
     # search 与 list、交互模式的 do_search 与 do_list）共用 apply_limit，所以这里
-    # 测的就是那四条路径共同的行为。
+    # 测的就是那四条路径共同的行为。-a 是同一条规则的另一个入口（等价于不给 -n），
+    # 也归在这里，末尾三条。
     _L = [1, 2, 3, 4, 5]
     eq(apply_limit(_L, None, "search"), (_L, 5, None), "不给 -n 就全列，也不多说一句")
     eq(apply_limit(_L, 5, "search"), (_L, 5, None), "-n 恰好等于总数时不算截断")
@@ -3356,6 +3370,16 @@ def run_selftest():
     _e1 = _raises(lambda: apply_limit(_L, -1, "search"), "-n -1 应当报错")
     eq(_e1.code, EXIT_USAGE, "负索引不得泄漏到表面：-1 曾静默丢掉最后一条匹配")
     _raises(lambda: apply_limit([], 0, "search"), "空列表配 -n 0 也该报错：校验先于数据")
+
+    # -a 折在 -n 的校验之前，所以上面那条「-n 0 报错」在给了 -a 时整条让位。
+    # 三条一组：单独给、与 --low 并存（_PAGE_WORDS 缺键就会在这里炸）、
+    # 以及「-n 被当作没写」这条语义的最尖的一刀——-n 0。
+    eq(apply_limit(_L, 2, "list", False, True), (_L, 5, None),
+       "-a 一律赢：给了 -n 也不截断、也不说明")
+    eq(apply_limit(_L, 2, "list", True, True), (_L, 5, None),
+       "-a 与 --low 并存：不截断，_PAGE_WORDS 也不缺键")
+    eq(apply_limit(_L, 0, "search", False, True), (_L, 5, None),
+       "-a 在时 -n 整条被忽略，含 -n 0 自己的合法性校验")
 
     _seven = [Component(id=f"{i:08d}-1111-2222-3333-444444444444", seq=i,
                         tags=["C", "0805", "1uF"], stock=Stock("coarse", level=0))
