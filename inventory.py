@@ -138,6 +138,15 @@ TYPE_ALIASES = {
     "BAT": ("电池", "电池座", "battery"),
     "TP": ("测试点", "testpoint"),
     "X": ("跳线", "跳帽", "jumper", "短接"),
+    # 五金是杂物堆——螺丝、螺母、垫片、铜柱、扎带、热缩管都往里放，彼此没有共同
+    # 的形状或参数，所以只做**显式码**：不挂任何描述词，也不配维度，写出来才算数。
+    #
+    # 码长两位是有意的，不是省事写短了。`H` 是电感单位「亨」（见 _UNIT_SUFFIXES_RAW），
+    # 规范码一旦叫 `H`，casefold 后的 `h` 就会随 ALIAS_TO_CODE 进 VOCAB 分词表，
+    # 于是最大匹配把 `XH` 切成 `X` + `H`、判成跳线——JST XH 连接器的整条识别链
+    # （_connector_series / 自检里的 `add 2p 2.54 jst XH`）就此断掉。加长到 `HW`
+    # 完全避开这个字母，`h` 留在 VOCAB 外，XH 系列与 `5H` 这类电感量都不受影响。
+    "HW": ("五金", "hardware"),
 }
 
 # 描述性词 → 类型码。这些词说的是**工艺或颜色**，不是类型本身，但单独出现时
@@ -1563,7 +1572,7 @@ def resolve_package_answer(tags, answer):
     return tags + [answer], answer
 
 
-_TYPE_HINT = "C R L D Q U J SW EC XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X"
+_TYPE_HINT = "C R L D Q U J SW EC XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X HW"
 
 # 自动补全类型时，用来向用户说明推断依据的短语。
 _SOURCE_LABEL = {
@@ -3188,6 +3197,16 @@ def run_selftest():
     eq(set(_TYPE_HINT.split()), set(TYPE_ALIASES),
        "「可用类型码」提示必须与 TYPE_ALIASES 完全一致")
 
+    # --- 五金码 HW 的别名健康度 ---
+    eq(canon_type("HW"), "HW", "HW 是规范码本身")
+    eq(canon_type("hw"), "HW", "类型码大小写不敏感")
+    eq(canon_type("五金"), "HW", "中文别名归约到 HW")
+    # 守住 JST 系列：码必须是两位的 HW，不能简写成 H。`h` 是电感单位「亨」，
+    # 规范码一旦叫 `H`，casefold 的 `h` 就会随 ALIAS_TO_CODE 进 VOCAB，最大匹配
+    # 便把 `XH` 切成 `X` + `H` 判成跳线，连接器系列的整条识别链会断。这条断言
+    # 是拦那一手的闸。
+    eq(canon_type("XH"), None, "XH 是连接器系列，不得被类型码吞掉")
+
     # --- 电容等价：用户给的核心需求 ---
     for t in ("100nF", "0.1uF", "1e-7F", "100NF", "100nf", "100n"):
         same("0.1uF", t)
@@ -3786,6 +3805,29 @@ def run_selftest():
     # 已知代价：`ec` 随规范码进了 VOCAB，`EC` + 单个规范码字母会被最大匹配切开
     # （`ECC` → `EC` + `C`），与 `SR` / `LS` 被切段同族。真库里没有这类标签。
     eq(canon_type("ECC"), "EC", "ECC 被判成 EC 是分词切段的已知代价，非回归")
+
+    # --- 五金 HW ---
+    # 五金是杂物堆，只做**显式码**：写出来才算数。没有任何描述词或参数能推断它——
+    # 螺丝、螺母、垫片、铜柱彼此没有共同的形状或参数，排针还早已经是 J。所以这里
+    # 钉的是「显式写就有、不写就报错」，而不是推断。
+    _hw = classify_tags(["HW", "双通铜柱", "m3", "8mm"])
+    eq(_hw.type_code, "HW", "HW 是显式类型码")
+    eq(_hw.type_source, "explicit", "HW 走别名表，来源是显式")
+    eq(_hw.added_type, None, "显式写了类型就不再补标签")
+    eq(_hw.package, "8mm", "8mm 落进封装槽（直插 LED 直径白名单，既有行为）")
+    eq(_hw.issues, (), "HW 双通铜柱 m3 8mm 不该报任何问题")
+    # 落盘列序是 type → main → package → other，所以 m3 在 8mm 前、名字排最后。
+    eq(canonical_tags(["HW", "双通铜柱", "m3", "8mm"]), ["HW", "m3", "8mm", "双通铜柱"],
+       "HW 记录的落盘列序")
+    # 不猜：五金名本身推不出类型，缺了 HW 就要如实报错，不能静默放过。
+    eq(tcode(["双通铜柱", "m3", "8mm"]), None, "五金名不参与类型推断")
+    ok(classify_tags(["双通铜柱", "m3", "8mm"]).has("type_missing"),
+       "没写 HW 时应报缺类型")
+    # 没有尺寸的五金件照样要求封装，用 无封装 兜底（与全库规则一致）。
+    ok(classify_tags(["HW", "螺丝", "m3"]).has("package_missing"),
+       "没有尺寸的五金件要报缺封装")
+    ok(not classify_tags(["HW", "螺丝", "m3", "无封装"]).has("package_missing"),
+       "写 无封装 后应通过")
 
     # --- 中文描述性词 ---
     eq(tcode(["直插", "5mm", "红"]), "LED", "颜色词应指向 LED")

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 电子元件库存管理 CLI。**纯标准库、无第三方依赖、无构建步骤、无 lint / formatter 配置**，改完直接跑。Python 3.14.6。
 
-`README.md`（876 行）是**权威规格**，中文写成，从命令用法到模糊识别的每一条规则都记了。本文件只写 README 里没有、或者要读好几个文件才能拼出来的东西。两者冲突时以实际行为为准，并把 README 一起改掉——这个仓库的 README 是活文档，用户自己一直在做代码与文档的同步演进，不要留下「文档说的和代码做的不一样」的状态。
+`README.md` 是**权威规格**，中文写成，从命令用法到模糊识别的每一条规则都记了。本文件只写 README 里没有、或者要读好几个文件才能拼出来的东西。两者冲突时以实际行为为准，并把 README 一起改掉——这个仓库的 README 是活文档，用户自己一直在做代码与文档的同步演进，不要留下「文档说的和代码做的不一样」的状态。
 
 ## 数据文件
 
@@ -25,7 +25,7 @@ python WarehouseKeeper.py               # 交互式 REPL
 python WarehouseKeeper.py -c "search 0.1uF"   # 不进入循环，退出码就是那条命令的结果
 ```
 
-**没有单测可以挑。** `run_selftest()` 是一个整体函数、958 项断言（`ok` / `eq` / `close` / `same` / `val` / `dim` / `_raises` 这些局部断言助手），没有过滤参数。要单独验一条规则，直接 import 模块调函数——注意 **`python -I` 会失败**，因为 `sys.path[0]` 得是仓库根目录：
+**没有单测可以挑。** `run_selftest()` 是一个整体函数，断言由一批局部助手（`ok` / `eq` / `close` / `same` / `val` / `dim` / `_raises`）逐条记录，没有过滤参数。要单独验一条规则，直接 import 模块调函数——注意 **`python -I` 会失败**，因为 `sys.path[0]` 得是仓库根目录：
 
 ```bash
 cd T:/component-inventory && python -c "import inventory as inv; print(inv.canon_unit('51r'))"
@@ -39,7 +39,7 @@ cd T:/component-inventory && python -c "import inventory as inv; print(inv.canon
 
 ## 架构
 
-`inventory.py` 单文件 4188 行，内部按**六层严格分层、依赖方向单向**，每层有 `# 第 N 层` 横幅注释：
+`inventory.py` 是单文件实现，内部按**六层严格分层、依赖方向单向**，每层有 `# 第 N 层` 横幅注释：
 
 ```
 常量与表 → 归一化 → 匹配 → 数据模型与持久化 → 渲染 → CLI
@@ -61,7 +61,7 @@ cd T:/component-inventory && python -c "import inventory as inv; print(inv.canon
 - 于是 `51r` 落盘成 `51Ω`（写法），而 `0.1uF ≡ 100nF` 的关系**永不写回**（判定）。
 - **模块 docstring 第 3 条「标签永远原样存盘，归一化结果只在查询期派生」是过时的**：它对"判定"成立，对"写法"不成立。以 `canonical_tags()` 的 docstring 与 README「写法在存盘时统一」为准。
 - `canonical_tags` **幂等**，所以「规范化」和「迁移」是同一件事——改一条记录会让全库的写法与列序一起收敛，没有单独的迁移命令。代价是「改一条会碰全库」这个隐性副作用，是知情取舍，不要"修"掉它。每条记录的 `updated_at` 不动。
-- 两套的**粒度也不同**：`canonical_tags` 只重写「数字 + ASCII 单位简写」，中缀记号（`4k7`）、裸数字（`0805`）、中文单位（`1欧`）、容差（`1%`）、型号（`1N4148`）一个字符都不碰。而 `canon_package("5x11mm")` 返回 `5x11` 只是**判定层**的身份归约：盘里那条标签仍然原样是 `5x11mm`（自检 3771 行那条 `_c5` 就是拿真实数据里这种记录在断言）。README「已知限制」里「`5x11mm` 归一到 `5x11`」说的是后者，读成存盘写法会误解。
+- 两套的**粒度也不同**：`canonical_tags` 只重写「数字 + ASCII 单位简写」，中缀记号（`4k7`）、裸数字（`0805`）、中文单位（`1欧`）、容差（`1%`）、型号（`1N4148`）一个字符都不碰。而 `canon_package("5x11mm")` 返回 `5x11` 只是**判定层**的身份归约：盘里那条标签仍然原样是 `5x11mm`（自检里的 `_c5` 就是拿一条 tags 写着 `5x11mm` 的电容在断言这个）。README「已知限制」里「`5x11mm` 归一到 `5x11`」说的是后者，读成存盘写法会误解。
 
 ### 类型有推断引擎，封装只能查表
 
