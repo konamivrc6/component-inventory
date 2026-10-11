@@ -14,6 +14,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 试验一律 `-f` 指向临时副本（好清理、好重来）。**成功路径就是写盘路径**——设计复现用例时要挑**确定会失败**的输入，否则你以为在验报错，其实是在写盘。踩过一个路径坑：**Git Bash 的 `$(mktemp -d)` 给出 `/tmp/...`，Windows 的 Python 看不见那个路径**，要用 `python -c "import tempfile;print(tempfile.gettempdir())"` 拿 Windows 侧的临时目录。
 
+**这个仓库里数据不入库，但同一份 `WarehouseKeeper.py` 会被复制到 `T:\lnwsWarehouse`——那里数据是入库的。** 那条命令（`sync`）靠「`inventory.json` 有没有被 git 跟踪」自动分辨两处，所以在这个仓库里跑 `sync` 会以退出码 2 拒绝。这是**有意行为，不是 bug**，别去"修"。
+
 ## 命令
 
 ```bash
@@ -23,6 +25,7 @@ python inventory.py add C 0805 100nF 50V --level 3
 python inventory.py list --low
 python WarehouseKeeper.py               # 交互式 REPL
 python WarehouseKeeper.py -c "search 0.1uF"   # 不进入循环，退出码就是那条命令的结果
+python WarehouseKeeper.py -c "sync"     # 与 GitHub 同步（只在这里看状态；本仓库会拒绝，见「架构」）
 ```
 
 **没有单测可以挑。** `run_selftest()` 是一个整体函数，断言由一批局部助手（`ok` / `eq` / `close` / `same` / `val` / `dim` / `_raises`）逐条记录，没有过滤参数。要单独验一条规则，直接 import 模块调函数——注意 **`python -I` 会失败**，因为 `sys.path[0]` 得是仓库根目录：
@@ -48,6 +51,18 @@ cd T:/component-inventory && python -c "import inventory as inv; print(inv.canon
 上层可以依赖下层，下层绝不依赖上层。`WarehouseKeeper.py` 是这套分层的第一个消费者：只做交互循环、行解析与追问，**业务逻辑一行都没复制**（`add` / `stock` / `remove` 都是构造一个假 args 转交给 `inventory.py` 的 `cmd_*`）。再加界面（Web UI / TUI）照同样路子来。`import inventory` 不会触发 argparse（有 `if __name__ == "__main__"` 保护）。
 
 两个跨模块的私有名是**故意**的，别顺手"清理"：`WarehouseKeeper.py` 从 `inventory` 导入 `_setup_console_encoding`（这是它唯一一个下划线开头的跨模块导入，注释也写在导入处）。那个函数管着「管道与重定向下 stdout 默认是 gbk，而 gbk 编不出 `µ`(U+00B5)」这件事，复制一份等于让两套实现各自演化。改动时**不要破坏它的签名**。同理 `-n` 的处理只有一份 `apply_limit`，命令行与 REPL 四条路径共用。
+
+### sync：全项目唯一的 subprocess
+
+`WarehouseKeeper.py` 的「同步层」是**这个项目里唯一会启动外部进程的地方**（`subprocess` 直调 `git`）。它取代了 `T:\lnwsWarehouse` 里那两个 `sync_pull.cmd` / `sync_push.cmd`，搬的是**仓库**而不是库存，所以核心层不认识它、也不该认识。它有三条性质是踩过坑定下来的：
+
+- **只读查询必须显式 `encoding="utf-8"`。** 本机 locale 是 cp936，而 git 的提交信息是 UTF-8；`subprocess.run(..., text=True)` 不指定编码会在 subprocess 的**读线程**里抛 `UnicodeDecodeError`，那个异常绕过 `except AppError`，表现为一整条裸回溯。这是 `µ`(U+00B5) 编不进 gbk 之后**同一类陷阱的第二次出现**。
+- **改动/联网的操作不捕获输出**，继承 stdio。捕获 stderr 会让 GCM 的认证提示变成一个静默的挂起——「看不见提示地卡住」比报错难查得多。调用前要 flush 自己的 stdout，否则块缓冲会让 git 的输出插到我们上一行说明之前。
+- **`sync` 与 `sync push` 绝不 fetch，只有 `sync pull` fetch。** `git push --force-with-lease` 不带参数时比的是「远端真实 ref」对「本地 `refs/remotes/<remote>/<branch>`」；推送前 fetch 会把 lease 的基线刷成远端当前值，远端即使被另一台机器推进过也会「匹配通过」，于是强推**静默覆盖对方**。这是单提交模型下 lease 唯一还有意义的前提。
+
+守卫是「`inventory.json` 有没有被 git 跟踪」而不是仓库名或分支名——同一份文件要原样活在两个仓库里（开发仓库多提交、数据不入库；同步仓库单提交、数据入库），写死任何一个都会在其中一边错。同理分支名与远端名从仓库推导，不写死 `main`。
+
+`sync` **不覆盖自检**：`run_selftest()` 在 `inventory.py` 里，只断言归一化与匹配，而 `python inventory.py --selftest` 根本不经过 `WarehouseKeeper.py`。
 
 ### 两套「归一化」必须分清
 

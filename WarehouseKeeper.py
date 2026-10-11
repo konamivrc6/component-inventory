@@ -21,6 +21,8 @@ edit 命令（标签写错了 remove 掉重录即可，这是既有决定）。
 
 import argparse
 import shlex
+import shutil
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -89,6 +91,12 @@ LIST_SPEC = {
     "--low": ("low", None),
 }
 
+# git 子进程的超时（秒）。只给只读查询用：git 卡住（仓库锁文件、坏掉的网络、
+# 在等交互输入）会把整个 REPL 挂死，而 `-c "sync"` 是无人值守的，更危险。
+# 改动/联网的操作（fetch / push）不设超时——它们本来就可能很慢，而且 GCM 的
+# 认证窗口可以等你任意久；那两条路靠 Ctrl+C 兜底。
+GIT_TIMEOUT = 30
+
 
 HELP_TEXT = """\
 命令
@@ -98,6 +106,7 @@ HELP_TEXT = """\
   stock  #编号 [值]              更改存量（值可以直接写：多 / plenty / 23 / +5）
   list                           列出全部（--low 只看存量偏低的；-a 不分页）
   remove #编号                   删除元件（会二次确认）
+  sync [pull|push]               与 GitHub 同步（无参＝只看状态，不动任何东西）
   help                           显示本帮助
   selftest                       跑一遍 inventory.py 的内置自检
   quit                           退出
@@ -125,6 +134,15 @@ stock 的值怎么写
   +5 / -3                 在当前存量上增减，裸 + / - 就是加一减一
   加5 / 用掉2 / add5      同一个意思（进：加增添补进入，出：减用耗去出丢损坏）
   只有 1-4 档的粗略存量不能增减，会报错让你先写成精确数
+
+sync：与 GitHub 同步
+  sync           只看状态：仓库、分支、提交、有没有未提交的改动
+  sync pull      用远端覆盖本地（破坏性，会先问一次）
+  sync push      把当前改动 amend 进那个唯一的提交，再强推上去
+  只对「把 inventory.json 纳入 git」的同步仓库有意义；开发仓库把数据 .gitignore
+  掉了，在那里 sync 会直接拒绝。pull 是覆盖不是合并——本地有未推送的改动时会被
+  硬拦下来，不会静默丢掉。推送被拒会以非 0 退出码失败，并告诉你下一步怎么走。
+  别用 VS Code 的 Sync Changes：它会 pull，会在这里造出一个合并提交。
 
 输入技巧
   search "100 nF"        标签里带空格时用引号括起来
@@ -278,6 +296,229 @@ def confirm(prompt):
         print()
         return False
     return ans in ("y", "yes")
+
+
+# =============================================================================
+# 同步层（git）
+# =============================================================================
+#
+# 这一层是本项目**唯一**会启动外部进程的地方。它把两个 .cmd 脚本里那套协议搬
+# 进了 Python：单提交模型——整个仓库永远只有一个提交，推送时 amend 覆盖它再
+# 强推，pull 则用远端整棵工作树覆盖本地。
+#
+# 判据是「数据文件有没有被 git 跟踪」，这正好是两个仓库的区别：同步仓库把
+# inventory.json 纳入版本控制（它就是要搬运的货物），而开发仓库把它 .gitignore
+# 掉。同一条命令因此在两边各有正确行为——一边正常跑，一边明确拒绝。
+#
+# 两条不可让步的性质，改动这一层时先看它们：
+#
+#   1. **status 与 push 绝不 fetch。** `git push --force-with-lease` 不带参数时，
+#      比的是「远端真实 ref」对「本地 refs/remotes/<remote>/<branch>」。一旦在
+#      push 前 fetch，lease 的基线就被刷成远端当前值，远端即使被另一台机器推
+#      进过也会「匹配通过」，于是强推静默覆盖对方。只有 sync pull 才 fetch。
+#
+#   2. **只读查询必须显式指定 UTF-8。** 本机 locale 是 cp936，而 git 的提交信息
+#      是 UTF-8；`subprocess.run(..., text=True)` 不指定编码会在 subprocess 的读
+#      线程里抛 UnicodeDecodeError，那个异常绕过 except AppError，表现为一整条
+#      裸回溯。这是继 `µ`(U+00B5) 编不进 gbk 之后同一类陷阱的第二次出现。
+
+
+_git_cache = {}
+
+
+def git_path():
+    """git 可执行文件的绝对路径。找不到就报错。
+
+    用绝对路径有两个理由：一是把「git 没装」变成一句干净的 AppError，而不是让
+    FileNotFoundError 从某个调用点冒出来；二是 Windows 上 CreateProcess 的搜索
+    顺序里**包含当前目录**，用绝对路径可以避免 cwd 里被人放一个 git.exe 顶掉。
+    """
+    if "path" not in _git_cache:
+        found = shutil.which("git")
+        if not found:
+            raise AppError("找不到 git。sync 需要 git 在 PATH 上。", EXIT_ERROR)
+        _git_cache["path"] = found
+    return _git_cache["path"]
+
+
+def git_capture(root, *args):
+    """跑一条只读 git 查询，返回 CompletedProcess（输出已解码成 str）。
+
+    只读查询才走这里。会改动仓库或联网的操作走 git_inherit——那条路不捕获输出，
+    因为认证提示（GCM 弹的窗）和进度条必须让用户看得见，捕获了就变成「看不见
+    提示地挂住」。
+    """
+    cmd = [git_path(), "-C", str(root), *args]
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        raise AppError(
+            f"git 超过 {GIT_TIMEOUT} 秒没有返回，已中止：git {' '.join(args)}",
+            EXIT_ERROR,
+        )
+    except OSError as e:
+        # FileNotFoundError 也是 OSError 的子类，一并接住。
+        raise AppError(f"启动 git 失败：{e}", EXIT_ERROR)
+
+
+def git_inherit(root, *args):
+    """跑一条会改动仓库或联网的 git 操作，返回它的退出码。
+
+    输出**不捕获**：继承 stdin/stdout/stderr，这样进度条、GCM 的认证提示、报错
+    都照常显示。捕获 stderr 会让「正在等你在浏览器里认证」变成一个静默的挂起。
+
+    调用前先 flush 自己的 stdout／stderr——Python 的 stdout 在管道下是块缓冲，
+    而 git 写的是同一个 fd、无缓冲，不 flush 会让 git 的输出插到我们上一行说明
+    之前，读起来像是顺序错乱。
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    cmd = [git_path(), "-C", str(root), *args]
+    try:
+        return subprocess.run(cmd).returncode
+    except OSError as e:
+        raise AppError(f"启动 git 失败：{e}", EXIT_ERROR)
+
+
+def git_text(root, *args):
+    """跑一条必须成功的只读查询，返回 stdout（已 strip）。失败抛 AppError。"""
+    r = git_capture(root, *args)
+    if r.returncode != 0:
+        raise AppError(
+            f"git {' '.join(args)} 失败：{r.stderr.strip() or r.stdout.strip()}",
+            EXIT_ERROR,
+        )
+    return r.stdout.strip()
+
+
+def git_ok(root, *args):
+    """一条只读查询，只关心成败。"""
+    return git_capture(root, *args).returncode == 0
+
+
+def find_repo_root(start_dir):
+    """start_dir 所属的仓库根，不在仓库里就返回 None。"""
+    r = git_capture(start_dir, "rev-parse", "--show-toplevel")
+    if r.returncode != 0:
+        return None
+    return Path(r.stdout.strip()).resolve()
+
+
+def require_syncable(path):
+    """确认这个数据文件所在的仓库可以同步，返回 (仓库根, 数据文件相对仓库根的路径)。
+
+    守卫就是「数据文件有没有被 git 跟踪」。不适用时给的是 EXIT_USAGE 而不是
+    错误——它表达的是「这条命令在这个仓库里没有意义」，不是「操作失败了」。
+    文案里不出现任何具体机器上的路径：这个程序会在两台电脑、好几个目录里跑。
+    """
+    data = Path(path).resolve()
+    root = find_repo_root(data.parent)
+    if root is None:
+        raise AppError(
+            f"sync 需要一个 git 仓库，但 {data.parent} 不在任何仓库里。\n"
+            "sync 是把库存数据在两台电脑之间搬运，没有仓库就没有可搬运的东西。",
+            EXIT_USAGE,
+        )
+    try:
+        rel = data.relative_to(root).as_posix()
+    except ValueError:
+        raise AppError(
+            "数据文件不在仓库里，sync 无从下手：\n"
+            f"  数据文件：{data}\n"
+            f"  仓库根：  {root}",
+            EXIT_USAGE,
+        )
+    if not git_ok(root, "ls-files", "--error-unmatch", "--", rel):
+        raise AppError(
+            "这个仓库没有把库存数据纳入 git，sync 在这里没有意义。\n"
+            f"  数据文件：{data}\n"
+            f"  仓库根：  {root}\n"
+            "sync 只对「把 inventory.json 纳入版本控制」的同步仓库有用；\n"
+            "开发仓库把数据 .gitignore 掉了，改代码在那里，搬数据才用 sync。",
+            EXIT_USAGE,
+        )
+    return root, rel
+
+
+def git_branch(root):
+    """当前分支名。detached HEAD 时 git 会返回字面的 HEAD，那种状态没法推拉。"""
+    branch = git_text(root, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch == "HEAD":
+        raise AppError("现在是 detached HEAD，不在任何分支上，sync 无从下手。",
+                       EXIT_USAGE)
+    return branch
+
+
+def git_remote(root, branch):
+    """分支跟踪的远端名，没配就回落 origin。
+
+    分支名与远端名一律从仓库里推导，不写死 main——这个文件要原样复制到两个
+    仓库，而它们的默认分支一个是 master、一个是 main。
+    """
+    r = git_capture(root, "config", f"branch.{branch}.remote")
+    remote = r.stdout.strip() if r.returncode == 0 else ""
+    return remote or "origin"
+
+
+def parse_status(root):
+    """跑一次 status，返回 (脏文件列表, ahead, behind)。
+
+    一次调用同时拿到「工作区脏不脏」与「相对上次同步点的 ahead/behind」。
+    --untracked-files=no：未跟踪文件（.bak、__pycache__）本来就不在版本控制里，
+    reset --hard 也不动它们，不该挡住 pull。quotepath=false：否则中文或特殊字符
+    的路径会被 git 转义成 \\346\\226\\207 之类，列出来没法看。
+
+    ahead/behind 相对的是**本地已知的**远端 ref，也就是上次 fetch/push 时的样子。
+    这个函数不 fetch（见本层开头的第 1 条），所以调用点的措辞一律说「上次同步点」，
+    不说「远端」。
+    """
+    out = git_text(root, "-c", "core.quotepath=false",
+                   "status", "--porcelain=v1", "--branch", "--untracked-files=no")
+    dirty = []
+    ahead = behind = 0
+    for line in out.splitlines():
+        if line.startswith("## "):
+            # 形状：`## main...origin/main [ahead 1, behind 2]`
+            tail = line.partition("[")[2]
+            if tail:
+                for part in tail.rstrip("]").split(","):
+                    part = part.strip()
+                    if part.startswith("ahead "):
+                        ahead = int(part[len("ahead "):])
+                    elif part.startswith("behind "):
+                        behind = int(part[len("behind "):])
+        elif line:
+            dirty.append(line)
+    return dirty, ahead, behind
+
+
+def sync_banner_line(path):
+    """banner 上那行同步状态；没有可说的就返回 None。
+
+    任何不对劲（不在仓库里、数据没跟踪、git 没装、读盘失败）都返回 None——
+    banner 绝不能把 REPL 启动搞崩。
+
+    在开发仓库里这一行根本不出现，零成本、零误导。措辞说「上次同步点」而不是
+    「远端」：这里不 fetch，ahead/behind 相对的是本地上次看到的远端。
+    """
+    try:
+        root, _rel = require_syncable(path)
+        _branch = git_branch(root)
+        dirty, ahead, behind = parse_status(root)
+    except Exception:
+        return None
+    if dirty:
+        return f"同步：有 {len(dirty)} 项未提交改动（收工记得 sync push）"
+    if ahead and behind:
+        return f"同步：与上次同步点分叉（领先 {ahead}、落后 {behind}）"
+    if ahead:
+        return f"同步：本地领先上次同步点 {ahead} 个提交（记得 sync push）"
+    if behind:
+        return f"同步：本地落后上次同步点 {behind} 个提交（记得 sync pull）"
+    return "同步：与上次同步点一致"
 
 
 # =============================================================================
@@ -559,6 +800,153 @@ def do_remove(rest, path):
     return cmd_remove(SimpleNamespace(target=rest[0]), path, confirm=confirm_remove)
 
 
+def sync_report(path):
+    """`sync`：把同步状态摊开，不动任何东西，也不联网。
+
+    标出的 ahead/behind 是相对上次同步点的，不是远端此刻的样子——不 fetch。
+    """
+    root, _rel = require_syncable(path)
+    branch = git_branch(root)
+    remote = git_remote(root, branch)
+    head = git_text(root, "rev-parse", "--short", "HEAD")
+    dirty, ahead, behind = parse_status(root)
+
+    print(f"仓库    {root}")
+    print(f"分支    {branch}  →  {remote}/{branch}")
+    print(f"提交    {head}")
+    if dirty:
+        print(f"工作区  有 {len(dirty)} 项未提交的改动：")
+        for line in dirty:
+            print(f"  {line}")
+    else:
+        print("工作区  干净")
+    if ahead and behind:
+        print(f"同步    与上次同步点分叉：本地领先 {ahead}、落后 {behind}")
+    elif ahead:
+        print(f"同步    本地领先上次同步点 {ahead} 个提交（收工记得 sync push）")
+    elif behind:
+        print(f"同步    本地落后上次同步点 {behind} 个提交（坐下记得 sync pull）")
+    else:
+        print("同步    与上次同步点一致")
+    try:
+        inv = get_inv(path)
+    except AppError:
+        pass
+    else:
+        print(f"库存    {len(inv.components)} 条")
+    return EXIT_OK
+
+
+def sync_pull(path):
+    """`sync pull`：用远端覆盖本地。破坏性——本地没推过的改动会没有。"""
+    root, _rel = require_syncable(path)
+    branch = git_branch(root)
+    remote = git_remote(root, branch)
+    upstream = f"{remote}/{branch}"
+
+    # 脏检查排在 fetch 之前，而且直接拒绝、不发问：有未提交的改动意味着本机录了
+    # 元件还没推，reset --hard 会把它们抹掉。旧 sync_pull.cmd 只在泛泛警告之后
+    # 就 reset，这里改成硬拦——宁可报错也不静默丢。
+    dirty, _ahead, _behind = parse_status(root)
+    if dirty:
+        raise AppError(
+            "本地有未推送的改动，pull 会把它们丢掉（pull 是覆盖，不做合并）：\n"
+            + "\n".join(f"  {line}" for line in dirty)
+            + "\n\n先 sync push 把它们推上去；确实要丢弃本地改动重来，"
+              "就在仓库里手动执行：\n"
+            + f"  git -C {root} stash\n"
+            + f"  git -C {root} reset --hard {upstream}",
+            EXIT_ERROR,
+        )
+
+    if git_inherit(root, "fetch", remote) != 0:
+        raise AppError(
+            f"从 {remote} 取回失败。检查网络，或者看看代理（clash）在不在跑。",
+            EXIT_ERROR,
+        )
+
+    up = git_capture(root, "rev-parse", upstream)
+    if up.returncode != 0:
+        raise AppError(f"远端没有 {upstream} 这个分支，没法 pull。", EXIT_ERROR)
+    up_sha = up.stdout.strip()
+    local = git_capture(root, "rev-parse", "HEAD")
+    if local.returncode != 0:
+        raise AppError("本地仓库还没有任何提交，没有可覆盖的东西。", EXIT_ERROR)
+    local_sha = local.stdout.strip()
+
+    if up_sha == local_sha:
+        print(f"两边的提交已经一致，不需要 pull。（{upstream}  {up_sha[:9]}）")
+        return EXIT_OK
+
+    # 追问块缩进：这几行是下面那个问题的上下文，和输入点属于同一段。
+    sub_print(f"远端 {upstream}  {up_sha[:9]}")
+    sub_print(f"本地 {branch}       {local_sha[:9]}")
+    sub_print("继续会用远端覆盖本地，本地没推过的改动都会丢。")
+    if not confirm("确认 pull？(y/N) > "):
+        print("已取消。")
+        return EXIT_OK
+
+    if git_inherit(root, "reset", "--hard", upstream) != 0:
+        raise AppError(f"reset --hard {upstream} 失败，本地可能还停在原样。",
+                       EXIT_ERROR)
+    print(f"已覆盖。本地现在是 {up_sha[:9]}。")
+    return EXIT_OK
+
+
+def sync_push(path):
+    """`sync push`：把工作树 amend 进那个唯一的提交，再强推上去。"""
+    root, _rel = require_syncable(path)
+    branch = git_branch(root)
+    remote = git_remote(root, branch)
+    upstream = f"{remote}/{branch}"
+
+    dirty, _ahead, _behind = parse_status(root)
+    head = git_capture(root, "rev-parse", "HEAD")
+    up = git_capture(root, "rev-parse", upstream)
+    in_sync = (head.returncode == 0 and up.returncode == 0
+               and head.stdout.strip() == up.stdout.strip())
+    if not dirty and in_sync:
+        print(f"没有需要推送的改动，本地与 {upstream} 一致。")
+        return EXIT_OK
+
+    # 这里**不 fetch**，见本层的第 1 条：push 前 fetch 会让 --force-with-lease
+    # 失去意义，静默覆盖另一台机器推过的提交。
+    if git_inherit(root, "add", "-A") != 0:
+        raise AppError("git add -A 失败。", EXIT_ERROR)
+    if git_inherit(root, "commit", "--amend", "--no-edit") != 0:
+        raise AppError(
+            "git commit --amend 失败。最常见的原因是仓库里还没有任何提交——\n"
+            "amend 得有个可改的东西。先手动 git commit 建一个，再来 sync push。",
+            EXIT_ERROR,
+        )
+    if git_inherit(root, "push", "--force-with-lease", "-u", remote, branch) != 0:
+        raise AppError(
+            "推送被拒。远端有本机没见过的提交，也就是说另一台机器推过东西。\n"
+            "本机这些改动没有丢，只是没上传。\n"
+            "先 sync pull 看看那边改了什么，再把本机的改动在它之上重做一遍。\n"
+            "千万不要改用 git push -f：那会静默抹掉对方的提交，而这份历史里\n"
+            "没有可恢复的东西。",
+            EXIT_ERROR,
+        )
+    print(f"已推送。本机与 {upstream} 同步在 "
+          f"{git_text(root, 'rev-parse', '--short', 'HEAD')}。")
+    return EXIT_OK
+
+
+def do_sync(rest, path):
+    if len(rest) > 1:
+        raise AppError("sync 最多写一个子动作：sync | sync pull | sync push",
+                       EXIT_USAGE)
+    action = rest[0].lower() if rest else "status"
+    if action in ("status", "sync"):
+        return sync_report(path)
+    if action == "pull":
+        return sync_pull(path)
+    if action == "push":
+        return sync_push(path)
+    raise AppError(f"未知的 sync 子动作：{action}（可用：pull / push）", EXIT_USAGE)
+
+
 def do_selftest(rest, path):
     return run_selftest()
 
@@ -574,6 +962,7 @@ COMMANDS = {
     "stock": do_stock,
     "list": do_list,
     "remove": do_remove,
+    "sync": do_sync,
     "help": do_help,
     "selftest": do_selftest,
 }
@@ -634,6 +1023,10 @@ def print_banner(path):
         print(f"  数据：{p}     共 {len(inv.components)} 条{tail}")
         if not inv.components and not p.exists():
             print("  （文件还不存在，第一次 add 会创建它。）")
+    # 同步状态只在「数据被 git 跟踪」的仓库里出现，别处连这一步都不走。
+    line = sync_banner_line(path)
+    if line:
+        print(f"  {line}")
     print("  输入 help 看命令，quit 退出。")
     print()
 
