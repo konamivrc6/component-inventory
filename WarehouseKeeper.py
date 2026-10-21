@@ -15,15 +15,24 @@ inventory.py，而这只在「作为脚本运行」时成立。
 缺数量、命中包含关系、删除前二次确认，命令行在这些地方要么报错、要么用选项绕过，
 交互场景该问就问。
 
+另一个可选增量是 autosync：写库后在后台线程里自动 sync push，默认关闭，只在交互
+模式生效（见「自动同步层」）。它不碰库存业务，只搬运文件。
+
 明确不做的事：全屏 TUI（当前是 Git Bash 伪终端，msvcrt 与 Windows 控制台 API 都读不到按键）；
 edit 命令（标签写错了 remove 掉重录即可，这是既有决定）。
 """
 
 import argparse
+import hashlib
+import json
+import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import traceback
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,6 +106,20 @@ LIST_SPEC = {
 # 认证窗口可以等你任意久；那两条路靠 Ctrl+C 兜底。
 GIT_TIMEOUT = 30
 
+# 自动同步的节流参数。两条都是「推迟推送」，不是「丢弃改动」——后台线程推的
+# 永远是数据文件的当前状态，等待期间攒下的改动会被同一次推送带走。
+#   合并窗口：连敲几条命令、或者 add 之后补数量造成的二次写盘，只推一次。
+#   冷却：两次推送之间至少隔这么久，高频输入时不至于每条命令都打一次网络。
+AUTOSYNC_DEBOUNCE = 1.0
+AUTOSYNC_COOLDOWN = 15.0
+# 退出时最多等后台线程多久。数据已经在盘上，等不到就留给下次。
+AUTOSYNC_EXIT_WAIT = 3.0
+AUTOSYNC_CONFIG_VERSION = 1
+AUTOSYNC_CONFIG_ENV = "WAREHOUSEKEEPER_CONFIG"
+# 后台 push 的上限。手动 push 没超时是因为前台能 Ctrl+C；后台线程里一旦挂住，
+# 没人看得见，还会一直攥着 git 操作锁，把之后的手动 sync 也堵死。
+AUTOSYNC_PUSH_TIMEOUT = 120.0
+
 
 HELP_TEXT = """\
 命令
@@ -107,6 +130,7 @@ HELP_TEXT = """\
   list                           列出全部（--low 只看存量偏低的；-a 不分页）
   remove #编号                   删除元件（会二次确认）
   sync [pull|push]               与 GitHub 同步（无参＝只看状态，不动任何东西）
+  autosync [on|off]              自动同步：写库后在后台自动 push（默认关闭）
   help                           显示本帮助
   selftest                       跑一遍 inventory.py 的内置自检
   quit                           退出
@@ -143,6 +167,17 @@ sync：与 GitHub 同步
   掉了，在那里 sync 会直接拒绝。pull 是覆盖不是合并——本地有未推送的改动时会被
   硬拦下来，不会静默丢掉。推送被拒会以非 0 退出码失败，并告诉你下一步怎么走。
   别用 VS Code 的 Sync Changes：它会 pull，会在这里造出一个合并提交。
+
+autosync：写库后自动推送
+  autosync               看开关、配置文件与后台状态
+  autosync on            开启（只在交互模式生效；-c 不会自动推送）
+  autosync off           关闭
+  开启后 add / stock / remove 写盘会自动 sync push，推送跑在后台线程里，
+  不会卡住提示符；结果显示在你敲下一条命令之前。连敲几条只推一次：合并 1 秒，
+  两次推送之间至少隔 15 秒。退出时若还有没推上去的改动，会再试一次。
+  推送失败不影响那条命令本身——数据已经写盘，只是记为「待同步」，下次重试。
+  工作区里有 inventory.json 之外的改动时会跳过自动推送，免得把代码或临时文件
+  一起 amend 进那个唯一的提交。
 
 输入技巧
   search "100 nF"        标签里带空格时用引号括起来
@@ -353,6 +388,11 @@ def git_capture(root, *args):
         return subprocess.run(
             cmd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT,
+            # stdin=DEVNULL 不是洁癖。自动同步在后台线程里调用这些查询，而主线程
+            # 这时通常正阻塞在 input() 的管道上；子进程一旦继承那个 stdin，git 会
+            # 跟着卡到那一行输入结束——实测一次 rev-parse 从 30 ms 变成好几秒。
+            # 只读查询本来就不该读 stdin。
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired:
         raise AppError(
@@ -495,8 +535,11 @@ def parse_status(root):
     return dirty, ahead, behind
 
 
-def sync_banner_line(path):
+def sync_banner_line(path, auto=False):
     """banner 上那行同步状态；没有可说的就返回 None。
+
+    auto=True 表示自动同步开着：那时「记得 sync push」是有害的提示——它马上就
+    会自己推，催用户手动推只会造成误解。
 
     任何不对劲（不在仓库里、数据没跟踪、git 没装、读盘失败）都返回 None——
     banner 绝不能把 REPL 启动搞崩。
@@ -510,15 +553,434 @@ def sync_banner_line(path):
         dirty, ahead, behind = parse_status(root)
     except Exception:
         return None
+    dirty_hint = "" if auto else "（收工记得 sync push）"
+    ahead_hint = "" if auto else "（记得 sync push）"
     if dirty:
-        return f"同步：有 {len(dirty)} 项未提交改动（收工记得 sync push）"
+        return f"同步：有 {len(dirty)} 项未提交改动{dirty_hint}"
     if ahead and behind:
         return f"同步：与上次同步点分叉（领先 {ahead}、落后 {behind}）"
     if ahead:
-        return f"同步：本地领先上次同步点 {ahead} 个提交（记得 sync push）"
+        return f"同步：本地领先上次同步点 {ahead} 个提交{ahead_hint}"
     if behind:
         return f"同步：本地落后上次同步点 {behind} 个提交（记得 sync pull）"
     return "同步：与上次同步点一致"
+
+
+# =============================================================================
+# 自动同步层
+# =============================================================================
+#
+# 自动同步要同时满足三件事，这一层的结构就是从它们推出来的：
+#
+#   1. **不阻塞提示符。** git push 是秒级的网络操作，不能挂在 REPL 主线程上。
+#      真正推送放在一个守护线程里，主线程只负责置事件和取结果。
+#
+#   2. **不打扰输入。** 后台线程绝不 print——它写到的行会和用户正在敲的那一行
+#      搅在一起，而 Windows 控制台没有可靠的办法把输入行重绘回来。所有消息先
+#      攒进 _AUTOSYNC_RESULTS，主循环在下一轮 input() 之前取走打印。
+#
+#   3. **不推不该推的东西。** sync_push 是 git add -A，整棵工作树一起 amend。
+#      自动同步只替用户推库存数据：工作区里还有别的改动时跳过并报警，而不是
+#      把正在改的 WarehouseKeeper.py 或临时文件也带进那个唯一的提交。
+#
+# 配置放在用户配置目录而不是仓库里，理由也和第 3 条同源：仓库里任何没被忽略
+# 的文件都会被 git add -A 带走；而 --file 可以把数据文件指到任意仓库，代码没法
+# 保证每个仓库都忽略某个固定文件名。放用户目录从根上消掉这类事故。
+#
+# pending 用「代次」表达（_AUTOSYNC_DONE < _AUTOSYNC_REQUESTED），不用布尔量：
+# 推送进行中又来了新写盘时，旧推送的成功不能把新改动误标成已同步。
+
+_AUTOSYNC_LOCK = threading.Lock()
+_AUTOSYNC_EVENT = threading.Event()   # 有改动待推
+_AUTOSYNC_FLUSH = threading.Event()   # 退出前的最后一次推送，跳过所有节流
+_AUTOSYNC_BUSY = threading.Event()    # 线程正在跑 git
+_AUTOSYNC_THREAD = None
+_AUTOSYNC_PATH = None
+_AUTOSYNC_REQUESTED = 0
+_AUTOSYNC_DONE = 0
+_AUTOSYNC_LAST_END = 0.0
+_AUTOSYNC_LAST_FAIL = 0.0      # 上一次失败的时刻
+_AUTOSYNC_FAIL_GEN = 0         # 那次失败覆盖到的代次
+_AUTOSYNC_RESULTS = []
+
+# 后台推送与手动 sync pull / push 之间的互斥。两边都会动 .git/index，
+# 同时跑会撞 index.lock；手动操作宁可等一下，也不要报一个莫名其妙的错。
+_GIT_OP_LOCK = threading.Lock()
+
+
+def autosync_config_path():
+    """每台机器一份配置，放在用户配置目录，**不放在仓库里**（理由见本节开头）。
+
+    环境变量覆盖是给测试隔离用的：同一台机器上跑沙盒时不必碰真实配置。
+    """
+    override = os.environ.get(AUTOSYNC_CONFIG_ENV)
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "lnwsWarehouse" / "autosync.json"
+
+
+def autosync_data_key(path):
+    """配置里区分数据文件的键：规范化后的绝对路径。
+
+    normcase 在 Windows 上抹平大小写与斜杠差异，同一条路径的不同写法落到同一个
+    键上。默认库与 --file 指的库因此各有各的开关。
+    """
+    return os.path.normcase(str(Path(path).resolve()))
+
+
+def _read_autosync_config():
+    """返回 (配置, 错误)。文件不存在不是错误——那就是默认的关闭状态。
+
+    读不懂时返回 (None, 错误) 而不是悄悄重建一份：配置坏了说明有人手改过或者
+    盘出了问题，静默覆盖会把设置连同证据一起抹掉。
+    """
+    p = autosync_config_path()
+    try:
+        raw = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"version": AUTOSYNC_CONFIG_VERSION, "data_files": {}}, None
+    except OSError as e:
+        return None, e
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as e:
+        return None, e
+    if not isinstance(data, dict) or not isinstance(data.get("data_files", {}), dict):
+        return None, ValueError("配置结构不对：data_files 应该是一个对象")
+    if data.get("version") != AUTOSYNC_CONFIG_VERSION:
+        return None, ValueError(f"不认识的配置版本：{data.get('version')!r}")
+    data.setdefault("data_files", {})
+    return data, None
+
+
+def autosync_is_enabled(path):
+    """开关是否打开。配置读不了按关闭处理；错误由 banner 与 autosync 命令显示。"""
+    data, _err = _read_autosync_config()
+    if data is None:
+        return False
+    entry = data["data_files"].get(autosync_data_key(path))
+    return bool(isinstance(entry, dict) and entry.get("autosync"))
+
+
+def _write_autosync_config(data):
+    """原子写。配置很小，但写到一半断电留下的坏 JSON 会让下次启动读不懂。"""
+    p = autosync_config_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".autosync-", suffix=".tmp")
+    except OSError as e:
+        raise AppError(f"无法创建自动同步配置：{p}（{e}）", EXIT_ERROR)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except OSError as e:
+        raise AppError(f"无法写入自动同步配置：{p}（{e}）", EXIT_ERROR)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def set_autosync(path, enabled):
+    """切换开关。写盘成功才算生效——存不下来的开关等于没改。"""
+    data, err = _read_autosync_config()
+    if err is not None:
+        raise AppError(
+            f"自动同步配置读不了：{autosync_config_path()}（{err}）。\n"
+            "修好或删除这个文件后再试。",
+            EXIT_ERROR,
+        )
+    data["data_files"][autosync_data_key(path)] = {"autosync": bool(enabled)}
+    _write_autosync_config(data)
+
+
+def inventory_fingerprint(path):
+    """数据文件的内容指纹。
+
+    用内容而不是 mtime/size：文件系统的时间精度不保证，而「数据写盘了却没有
+    自动推送」是这一层最不能接受的静默失败。二十来 KB 的文件读两次可以忽略。
+
+    三种结果：("sha256", 摘要) / ("missing", "") / None（读失败，无从判断）。
+    """
+    try:
+        data = Path(path).read_bytes()
+    except FileNotFoundError:
+        return ("missing", "")
+    except OSError:
+        return None
+    return ("sha256", hashlib.sha256(data).hexdigest())
+
+
+def inventory_changed(before, after):
+    """两次指纹都拿得到且不同才算变。读失败时宁可不推，也不误推。"""
+    return before is not None and after is not None and before != after
+
+
+def autosync_dirty_paths(root):
+    """会被 git add -A 带走的路径：已跟踪的改动 + 未跟踪且未忽略的新文件。
+
+    这里不能用 parse_status——它对 pull 的脏检查用的是 --untracked-files=no，
+    而未跟踪文件一样会被 git add -A 带走。已忽略的 .bak / __pycache__ 不会出现在
+    这个列表里，所以它们不会挡住自动同步。
+    """
+    # 不能用 git_text：它对 stdout 做 strip()，而 porcelain 的第一列是状态字符，
+    # 未暂存改动那一行的行首恰好是空格（" M path"）。strip 掉之后按固定偏移取
+    # 路径会少一个字符，把 inventory.json 读成 nventory.json——安全闸于是把数据
+    # 文件自己当成「别的改动」，永远跳过自动推送。
+    r = git_capture(root, "-c", "core.quotepath=false",
+                    "status", "--porcelain=v1", "--untracked-files=all")
+    if r.returncode != 0:
+        raise AppError(
+            f"git status 失败：{r.stderr.strip() or r.stdout.strip()}",
+            EXIT_ERROR,
+        )
+    paths = []
+    for line in r.stdout.splitlines():
+        if not line or line.startswith("## "):
+            continue
+        path = line[3:]
+        if " -> " in path:   # 重命名：git 报的是「旧 -> 新」，取新路径
+            path = path.split(" -> ", 1)[1]
+        paths.append(path)
+    return paths
+
+
+def _autosync_blockers(path):
+    """数据文件之外会挡路的改动。自动同步只替用户推库存数据。"""
+    root, rel = require_syncable(path)
+    return [p for p in autosync_dirty_paths(root) if p != rel]
+
+
+def _note_autosync_failure(gen):
+    """记下这次尝试失败了。退出时据此判断「刚刚才撞过墙」——不必立刻再撞一次。"""
+    global _AUTOSYNC_LAST_FAIL, _AUTOSYNC_FAIL_GEN
+    with _AUTOSYNC_LOCK:
+        _AUTOSYNC_LAST_FAIL = time.monotonic()
+        _AUTOSYNC_FAIL_GEN = gen
+
+
+def _git_quiet(root, *args, timeout=None):
+    """后台线程专用的 git 调用：捕获输出、禁止终端认证提示。
+
+    不能用 git_inherit：它把子进程直接接到终端上，后台线程的输出会和用户的输入
+    行搅在一起。也不能让 git 在没人看着的地方弹认证提示——GIT_TERMINAL_PROMPT=0
+    让它在没有缓存凭据时立刻失败；用户手动 sync push 一次（前台能看到 GCM 的
+    窗口）就把凭据缓存好了。timeout 只给 push 用（见 AUTOSYNC_PUSH_TIMEOUT）：
+    add / commit 是本地操作，快到不值得再引入一种失败。
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    cmd = [git_path(), "-C", str(root), *args]
+    try:
+        # stdin=DEVNULL 与 git_capture 同一个理由：后台线程的 git 不能等主线程
+        # 正在 input() 的那根管道。后台这条路也不该有任何交互余地。
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env,
+                              stdin=subprocess.DEVNULL, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise AppError(
+            f"git 超过 {timeout:.0f} 秒没有返回，已中止：git {' '.join(args)}",
+            EXIT_ERROR,
+        )
+    except OSError as e:
+        raise AppError(f"启动 git 失败：{e}", EXIT_ERROR)
+
+
+def _autosync_guidance(path):
+    """推送失败之后该做什么。这段文字在后台线程里生成，主线程原样打印。
+
+    绝不能建议「先 sync pull」：此时 amend 已经完成、工作区是干净的，pull 的脏
+    检查拦不住它，reset --hard 会把刚录的元件连同本地提交一起覆盖掉。
+    """
+    lines = [
+        "本机数据已经写盘，改动也在本地提交里，没有丢——只是还没上传。",
+        "已记为「待同步」，下次写库或退出时会再试一次。",
+        "如果原因是另一台机器推过东西（--force-with-lease 被拒）：",
+        "  不要直接 sync pull：本机改动已经 amend 进那个唯一的提交，pull 会把它覆盖掉。",
+        f"  先把 {Path(path).name} 复制到仓库外留底，再 sync pull，对照留底重新录入，最后 sync push。",
+    ]
+    try:
+        root, rel = require_syncable(path)
+        branch = git_branch(root)
+        remote = git_remote(root, branch)
+    except AppError:
+        return lines
+    lines.append("想先看差异（不覆盖任何东西）：")
+    lines.append(f"  git -C {root} fetch")
+    lines.append(f"  git -C {root} diff HEAD {remote}/{branch} -- {rel}")
+    return lines
+
+
+def _autosync_sleep(seconds):
+    """可以被退出打断的等待。冷却最长 15 秒，退出时不能陪着它干等。"""
+    deadline = time.monotonic() + seconds
+    while not _AUTOSYNC_FLUSH.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.05))
+
+
+def _autosync_worker():
+    """后台推送线程。全进程只有这一个，daemon 保证它不会拖住退出。"""
+    global _AUTOSYNC_DONE, _AUTOSYNC_LAST_END
+    while True:
+        _AUTOSYNC_EVENT.wait()
+        _AUTOSYNC_EVENT.clear()
+
+        if not _AUTOSYNC_FLUSH.is_set():
+            # 合并窗口。这期间进来的写盘由下面那次推送一起带走。
+            _autosync_sleep(AUTOSYNC_DEBOUNCE)
+            _AUTOSYNC_EVENT.clear()
+            wait = _AUTOSYNC_LAST_END + AUTOSYNC_COOLDOWN - time.monotonic()
+            if wait > 0:
+                _autosync_sleep(wait)
+                _AUTOSYNC_EVENT.clear()
+
+        # 代次在这里取，才包含等待期间进来的所有改动。
+        _GIT_OP_LOCK.acquire()
+        try:
+            with _AUTOSYNC_LOCK:
+                gen = _AUTOSYNC_REQUESTED
+                path = _AUTOSYNC_PATH
+                needed = gen > _AUTOSYNC_DONE
+            if not needed:
+                # 等待期间手动 sync push 已经结清，或者 autosync off 把账追平了。
+                # 没必要再推一次空车。
+                continue
+            _AUTOSYNC_BUSY.set()
+            lines = []
+            try:
+                blockers = _autosync_blockers(path)
+                if blockers:
+                    name = Path(path).name
+                    lines.append(f"自动同步已跳过：工作区里还有 {name} 之外的改动。")
+                    lines.append("  自动同步只替你推库存数据；先处理这些改动，或手动 sync push。")
+                    lines.extend(f"  {b}" for b in blockers)
+                    _note_autosync_failure(gen)
+                else:
+                    sync_push(path, auto=True,
+                              emit=lambda line: lines.append(f"自动同步：{line}"))
+                    with _AUTOSYNC_LOCK:
+                        _AUTOSYNC_DONE = max(_AUTOSYNC_DONE, gen)
+            except AppError as e:
+                lines.append(f"自动同步失败：{e}")
+                lines.extend(_autosync_guidance(path))
+                _note_autosync_failure(gen)
+            except Exception as e:
+                # 后台线程里抛出去的异常没人接，线程会直接死掉，从此再不同步。
+                lines.append(f"自动同步失败（内部错误）：{e}")
+                _note_autosync_failure(gen)
+            finally:
+                _AUTOSYNC_BUSY.clear()
+                with _AUTOSYNC_LOCK:
+                    # 失败也计入冷却。断网时每条命令都去撞一次网络毫无意义。
+                    _AUTOSYNC_LAST_END = time.monotonic()
+                    _AUTOSYNC_RESULTS.extend(lines)
+        finally:
+            _GIT_OP_LOCK.release()
+
+
+def _ensure_autosync_worker(path):
+    global _AUTOSYNC_THREAD, _AUTOSYNC_PATH
+    with _AUTOSYNC_LOCK:
+        _AUTOSYNC_PATH = path
+        if _AUTOSYNC_THREAD is None or not _AUTOSYNC_THREAD.is_alive():
+            t = threading.Thread(target=_autosync_worker, name="autosync", daemon=True)
+            _AUTOSYNC_THREAD = t
+            t.start()
+
+
+def autosync_request(path):
+    """主线程：登记一次写盘。开关关闭时什么都不做。"""
+    global _AUTOSYNC_REQUESTED
+    try:
+        if not autosync_is_enabled(path):
+            return
+        _ensure_autosync_worker(path)
+        with _AUTOSYNC_LOCK:
+            _AUTOSYNC_REQUESTED += 1
+        _AUTOSYNC_EVENT.set()
+    except Exception:
+        # 自动同步是附加功能，它自己的任何故障都不许影响 REPL。
+        pass
+
+
+def autosync_pending():
+    """还有改动没推上去。代次不相等就说明最后一次请求还没被成功覆盖。"""
+    with _AUTOSYNC_LOCK:
+        return _AUTOSYNC_DONE < _AUTOSYNC_REQUESTED
+
+
+def autosync_mark_synced():
+    """手动 sync push 成功、或关闭自动同步时调用：把账面追平，免得再推一次空车。"""
+    global _AUTOSYNC_DONE
+    with _AUTOSYNC_LOCK:
+        _AUTOSYNC_DONE = _AUTOSYNC_REQUESTED
+    _AUTOSYNC_EVENT.clear()
+
+
+def autosync_drain():
+    """把后台线程攒下的消息取出来打印。只在主线程、提示符之前调用。"""
+    with _AUTOSYNC_LOCK:
+        lines = list(_AUTOSYNC_RESULTS)
+        _AUTOSYNC_RESULTS.clear()
+    for line in lines:
+        print(line)
+
+
+def autosync_wait_idle():
+    """手动 sync pull / push 之前调用，拿住 git 操作锁。调用方负责释放。
+
+    后台推送可能正在跑，也可能还在合并窗口/冷却里睡觉——后者不占锁，手动操作
+    可以直接跑；它睡醒后的那次推送大概率是空车，sync_push 自己会认出来。
+    """
+    if _AUTOSYNC_BUSY.is_set():
+        print("等待后台自动同步完成…")
+    _GIT_OP_LOCK.acquire()
+
+
+def autosync_finish(path):
+    """退出前的最后一次机会：绕过节流补推一次，最多等 AUTOSYNC_EXIT_WAIT 秒。
+
+    等不到也不慌：数据在盘上，本地提交也在；下次写库或手动 sync push 会带上。
+    """
+    try:
+        autosync_drain()
+        if not autosync_is_enabled(path) or not autosync_pending():
+            return
+        with _AUTOSYNC_LOCK:
+            # 刚失败过、且之后没有新改动，立刻再撞一次只会把同一段长警告打第二遍。
+            just_failed = (_AUTOSYNC_FAIL_GEN == _AUTOSYNC_REQUESTED
+                           and time.monotonic() - _AUTOSYNC_LAST_FAIL < AUTOSYNC_COOLDOWN)
+        if just_failed:
+            print("自动同步仍未完成（最近一次尝试刚刚失败）；本机改动仍在，"
+                  "下次写库或手动 sync push 会再试。")
+            return
+        _ensure_autosync_worker(path)
+        print("正在完成自动同步（最多等 3 秒）…")
+        _AUTOSYNC_FLUSH.set()
+        _AUTOSYNC_EVENT.set()
+        t = _AUTOSYNC_THREAD
+        if t is not None:
+            t.join(AUTOSYNC_EXIT_WAIT)
+        autosync_drain()
+        if autosync_pending():
+            print("自动同步还没完成；本机改动仍在，下次写库或手动 sync push 会再试。")
+    except Exception:
+        pass
+    finally:
+        _AUTOSYNC_FLUSH.clear()
 
 
 # =============================================================================
@@ -893,8 +1355,13 @@ def sync_pull(path):
     return EXIT_OK
 
 
-def sync_push(path):
-    """`sync push`：把工作树 amend 进那个唯一的提交，再强推上去。"""
+def sync_push(path, auto=False, emit=print):
+    """`sync push`：把工作树 amend 进那个唯一的提交，再强推上去。
+
+    auto=True 是后台自动同步走的路：不继承终端，所有输出交给 emit。代价是看不到
+    git 的进度和认证提示，所以那条路禁止终端认证（见 _git_quiet）——没缓存凭据时
+    快速失败，由调用方提示用户手动推一次，而不是无声地挂住。
+    """
     root, _rel = require_syncable(path)
     branch = git_branch(root)
     remote = git_remote(root, branch)
@@ -906,30 +1373,59 @@ def sync_push(path):
     in_sync = (head.returncode == 0 and up.returncode == 0
                and head.stdout.strip() == up.stdout.strip())
     if not dirty and in_sync:
-        print(f"没有需要推送的改动，本地与 {upstream} 一致。")
+        # 必须走 emit：auto=True 时这个函数跑在后台线程里，直接 print 会把输出
+        # 插进用户正在输入的提示符。
+        emit(f"没有需要推送的改动，本地与 {upstream} 一致。")
         return EXIT_OK
 
     # 这里**不 fetch**，见本层的第 1 条：push 前 fetch 会让 --force-with-lease
     # 失去意义，静默覆盖另一台机器推过的提交。
-    if git_inherit(root, "add", "-A") != 0:
-        raise AppError("git add -A 失败。", EXIT_ERROR)
-    if git_inherit(root, "commit", "--amend", "--no-edit") != 0:
-        raise AppError(
-            "git commit --amend 失败。最常见的原因是仓库里还没有任何提交——\n"
-            "amend 得有个可改的东西。先手动 git commit 建一个，再来 sync push。",
-            EXIT_ERROR,
+    if auto:
+        for args, failure in (
+            (("add", "-A"), "git add -A 失败。"),
+            (("commit", "--amend", "--no-edit"),
+             "git commit --amend 失败。最常见的原因是仓库里还没有任何提交——\n"
+             "amend 得有个可改的东西。先手动 git commit 建一个，再来 sync push。"),
+        ):
+            r = _git_quiet(root, *args)
+            if r.returncode != 0:
+                detail = r.stderr.strip() or r.stdout.strip()
+                raise AppError(f"{failure}\n{detail}" if detail else failure, EXIT_ERROR)
+        pushed = _git_quiet(root, "push", "--force-with-lease", "-u", remote, branch,
+                            timeout=AUTOSYNC_PUSH_TIMEOUT)
+        push_ok = pushed.returncode == 0
+        push_detail = pushed.stderr.strip() or pushed.stdout.strip()
+    else:
+        if git_inherit(root, "add", "-A") != 0:
+            raise AppError("git add -A 失败。", EXIT_ERROR)
+        if git_inherit(root, "commit", "--amend", "--no-edit") != 0:
+            raise AppError(
+                "git commit --amend 失败。最常见的原因是仓库里还没有任何提交——\n"
+                "amend 得有个可改的东西。先手动 git commit 建一个，再来 sync push。",
+                EXIT_ERROR,
+            )
+        push_ok = git_inherit(root, "push", "--force-with-lease", "-u", remote, branch) == 0
+        push_detail = ""
+
+    if not push_ok:
+        message = (
+            "推送失败。本机改动没有丢：数据已经写进 "
+            f"{_rel}，并 amend 进本地提交，工作区是干净的。\n"
+            "如果另一台机器推过东西，--force-with-lease 会拒绝覆盖它——远端有本机没见过的提交。\n"
+            "不要直接执行 sync pull：pull 会用远端 reset --hard 覆盖本地，刚录的数据会没有。\n"
+            "安全的顺序：\n"
+            f"  1. 把 {_rel} 复制到仓库外留一份；\n"
+            "  2. 执行 sync pull，接收另一台机器的版本；\n"
+            "  3. 对照留底，把本机新增或修改的条目用 add / stock 重新录入；\n"
+            "  4. 执行 sync push。\n"
+            "如果只是网络或认证失败，修好后直接重试 sync push，同样不要先 pull。\n"
+            "不要用 git push -f：那会静默抹掉对方的提交，而这份历史里没有可恢复的东西。"
         )
-    if git_inherit(root, "push", "--force-with-lease", "-u", remote, branch) != 0:
-        raise AppError(
-            "推送被拒。远端有本机没见过的提交，也就是说另一台机器推过东西。\n"
-            "本机这些改动没有丢，只是没上传。\n"
-            "先 sync pull 看看那边改了什么，再把本机的改动在它之上重做一遍。\n"
-            "千万不要改用 git push -f：那会静默抹掉对方的提交，而这份历史里\n"
-            "没有可恢复的东西。",
-            EXIT_ERROR,
-        )
-    print(f"已推送。本机与 {upstream} 同步在 "
-          f"{git_text(root, 'rev-parse', '--short', 'HEAD')}。")
+        if push_detail:
+            message += f"\n\ngit 的输出：\n{push_detail}"
+        raise AppError(message, EXIT_ERROR)
+    emit(f"已推送。本机与 {upstream} 同步在 "
+         f"{git_text(root, 'rev-parse', '--short', 'HEAD')}。")
     return EXIT_OK
 
 
@@ -940,11 +1436,86 @@ def do_sync(rest, path):
     action = rest[0].lower() if rest else "status"
     if action in ("status", "sync"):
         return sync_report(path)
-    if action == "pull":
-        return sync_pull(path)
-    if action == "push":
-        return sync_push(path)
+    if action in ("pull", "push"):
+        # 后台自动推送正在跑时，两边会抢 .git/index。手动操作是用户明确要求的，
+        # 让它等一会儿，而不是撞出一个 index.lock 的错。
+        autosync_wait_idle()
+        try:
+            code = sync_pull(path) if action == "pull" else sync_push(path)
+        finally:
+            _GIT_OP_LOCK.release()
+        # 手动推成功就等于把账面上的待同步一起结清了，别让后台再推一次空车。
+        # pull 不能这么记：用户取消 pull 时它也返回 0。
+        if action == "push" and code == EXIT_OK:
+            autosync_mark_synced()
+        return code
     raise AppError(f"未知的 sync 子动作：{action}（可用：pull / push）", EXIT_USAGE)
+
+
+def do_autosync(rest, path):
+    """查看或切换自动同步。只动配置文件，不碰库存数据。"""
+    if len(rest) > 1:
+        raise AppError("autosync 最多写一个子动作：on / off", EXIT_USAGE)
+    action = rest[0].lower() if rest else "status"
+    cfg = autosync_config_path()
+    _data, err = _read_autosync_config()
+
+    if action == "status":
+        print(f"自动同步    {'开启' if autosync_is_enabled(path) else '关闭（默认）'}")
+        print(f"数据文件    {Path(path).resolve()}")
+        print(f"配置文件    {cfg}")
+        if err is not None:
+            print(f"配置错误    {err}")
+            print("提示：修好或删除这个文件后再改开关。")
+            return EXIT_ERROR
+        if autosync_pending():
+            print("后台状态    有待同步的改动（下次写库或退出时会重试）")
+        elif _AUTOSYNC_BUSY.is_set():
+            print("后台状态    正在推送")
+        else:
+            print("后台状态    空闲")
+        if autosync_is_enabled(path):
+            print("说明        只对交互模式生效：add / stock / remove 写盘后自动 push，-c 不会触发。")
+        else:
+            print("说明        用 autosync on 开启。")
+        return EXIT_OK
+
+    if action == "on":
+        if err is not None:
+            raise AppError(
+                f"自动同步配置读不了：{cfg}（{err}）。\n修好或删除这个文件后再试。",
+                EXIT_ERROR,
+            )
+        if autosync_is_enabled(path):
+            print("自动同步已经开启。")
+            return EXIT_OK
+        # 预检放在写配置之前：在开发仓库（数据没被 git 跟踪）或 detached HEAD 下
+        # 开启，只会得到一个永远不生效的开关。
+        try:
+            root, _rel = require_syncable(path)
+            git_branch(root)
+        except AppError as e:
+            raise AppError(f"不能开启自动同步：{e}", e.code)
+        set_autosync(path, True)
+        print("已开启自动同步：add / stock / remove 写盘后会自动 sync push。")
+        print("推送在后台线程里跑，不会卡住提示符；连敲几条只推一次，"
+              "两次推送之间至少隔 15 秒。")
+        print("只对交互模式生效；-c 不会自动推送。"
+              f"工作区有 {Path(path).name} 之外的改动时会跳过。")
+        return EXIT_OK
+
+    if action == "off":
+        if err is not None:
+            raise AppError(
+                f"自动同步配置读不了：{cfg}（{err}）。\n修好或删除这个文件后再试。",
+                EXIT_ERROR,
+            )
+        set_autosync(path, False)
+        autosync_mark_synced()
+        print("已关闭自动同步。写库不再自动推送；本机若有未推送的改动，请手动 sync push。")
+        return EXIT_OK
+
+    raise AppError(f"未知的 autosync 子动作：{action}（可用：on / off）", EXIT_USAGE)
 
 
 def do_selftest(rest, path):
@@ -963,6 +1534,7 @@ COMMANDS = {
     "list": do_list,
     "remove": do_remove,
     "sync": do_sync,
+    "autosync": do_autosync,
     "help": do_help,
     "selftest": do_selftest,
 }
@@ -1023,10 +1595,21 @@ def print_banner(path):
         print(f"  数据：{p}     共 {len(inv.components)} 条{tail}")
         if not inv.components and not p.exists():
             print("  （文件还不存在，第一次 add 会创建它。）")
+    data, cfg_err = _read_autosync_config()
+    auto_on = False
+    if data is not None:
+        entry = data["data_files"].get(autosync_data_key(path))
+        auto_on = isinstance(entry, dict) and bool(entry.get("autosync"))
+
     # 同步状态只在「数据被 git 跟踪」的仓库里出现，别处连这一步都不走。
-    line = sync_banner_line(path)
+    line = sync_banner_line(path, auto=auto_on)
     if line:
         print(f"  {line}")
+    # 自动同步只在这一行有话说时占屏：默认关闭就不提，免得每次启动多一行噪音。
+    if cfg_err is not None:
+        print(f"  自动同步：配置读不了，按关闭处理（{cfg_err}）")
+    elif auto_on:
+        print("  自动同步：开启（改库后后台推送）")
     print("  输入 help 看命令，quit 退出。")
     print()
 
@@ -1042,9 +1625,12 @@ def advise(code, path):
         print(f"提示：数据文件格式有问题（{path}）；上一版在 {Path(path).name}.bak。")
 
 
-def dispatch(line, path):
-    """执行一行命令，返回退出码。"""
-    verb, rest = split_line(line)
+def dispatch_verb(verb, rest, path):
+    """执行已经切好的命令，返回退出码。
+
+    REPL 用这个版本：它本来就要知道 verb 才能跳过 sync 自己的自动推送，再回
+    去 split_line 一次等于把同一行解析两遍。
+    """
     if not verb:
         return EXIT_OK
     handler = COMMANDS.get(verb)
@@ -1053,15 +1639,26 @@ def dispatch(line, path):
     return handler(rest, path)
 
 
+def dispatch(line, path):
+    """执行一行命令，返回退出码。`-c` 与命令行入口用这个签名。"""
+    verb, rest = split_line(line)
+    return dispatch_verb(verb, rest, path)
+
+
 def repl(path):
     setup_stdin_encoding()
     print_banner(path)
 
     last_code = EXIT_OK
     while True:
+        # 后台推送的结果在这里落地：此刻用户还没开始敲下一行，打印不会弄乱提示符。
+        # 后台线程绝不自己 print，原因见自动同步层的第 2 条。
+        autosync_drain()
+
         try:
             raw = input(PROMPT)
         except EOFError:
+            autosync_finish(path)
             print("\n再见。")
             return last_code
         except KeyboardInterrupt:
@@ -1078,13 +1675,21 @@ def repl(path):
         if not raw.strip():
             continue
         if raw.strip().lower() in QUIT_WORDS:
+            # 退出前把还没推上去的改动补推一次（最多等 AUTOSYNC_EXIT_WAIT 秒）。
+            autosync_finish(path)
             # 前面补一个换行，不然「再见。」会挤在提示符后面（EOF 那条路的
             # print 本来就带 \n，两边对齐）。
             print("\n再见。")
             return last_code
 
+        # 指纹在解析之前取：命令无论成功、失败还是被取消，都能如实反映它有没有
+        # 动过盘。verb 同时用于跳过 sync 自己——sync pull 会改文件，但刚 pull
+        # 完立刻 push 正是「覆盖不是合并」里最不该发生的事。
+        verb = None
+        before = inventory_fingerprint(path)
         try:
-            last_code = dispatch(raw, path)
+            verb, rest = split_line(raw)
+            last_code = dispatch_verb(verb, rest, path)
         except AppError as e:
             print(f"错误：{e}", file=sys.stderr)
             last_code = e.code
@@ -1107,6 +1712,12 @@ def repl(path):
             print("内部错误（这是程序缺陷，请把下面的回溯报告出来）：", file=sys.stderr)
             traceback.print_exc()
             last_code = EXIT_ERROR
+
+        after = inventory_fingerprint(path)
+        if verb and verb != "sync" and inventory_changed(before, after):
+            # autosync_request 自己吞掉全部异常：同步是附加功能，不能反过来把
+            # REPL 弄坏，也不能改变刚才那条命令的退出码。
+            autosync_request(path)
 
         # 每条命令之后空一行，把这次的输出和下一个提示符隔开。
         # 放在 try 外面，成功和失败都走到——出错时的文字同样需要呼吸空间。
