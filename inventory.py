@@ -147,6 +147,20 @@ TYPE_ALIASES = {
     # （_connector_series / 自检里的 `add 2p 2.54 jst XH`）就此断掉。加长到 `HW`
     # 完全避开这个字母，`h` 留在 VOCAB 外，XH 系列与 `5H` 这类电感量都不受影响。
     "HW": ("五金", "hardware"),
+    # 模块与开发板。它们不是芯片——`U` 说的是裸器件，而 ESP32-S3-WROOM 是模组、
+    # LM2596 降压板是成品小板。更要紧的是型号表会把 `ESP32` / `LM2596` 这类
+    # 前缀直接推成 U（强度 2，REPL 连问都不问），所以想归到这里就必须**显式
+    # 写**。与 HW 同样只做显式码：不挂描述词、不配维度、不进型号表——同一个
+    # 型号既可能是裸件也可能是模块，标签本身分不出来，猜不得。
+    #
+    # 开发板不另开 `DEV`：DevKit 就是「模组 + USB + 稳压」，边界模糊，多一个
+    # 码只多一次录入决策。要区分就用普通标签 `开发板` / `核心板`，检索照样
+    # 命中。
+    #
+    # 已知代价与 `s` / `ec` 同族：`mod` 随别名进了 VOCAB，`MODBUS` / `MOD485`
+    # 这类连写标签会被切出 MOD 再留残余。残余回退把它们整段退回原 token，子串
+    # 回退的 ASCII 词边界也不认 `modbus` 里的 mod——这两条都由自检钉住。
+    "MOD": ("模块", "模组", "开发板", "module", "mod"),
 }
 
 # 描述性词 → 类型码。这些词说的是**工艺或颜色**，不是类型本身，但单独出现时
@@ -1572,7 +1586,7 @@ def resolve_package_answer(tags, answer):
     return tags + [answer], answer
 
 
-_TYPE_HINT = "C R L D Q U J SW EC XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X HW"
+_TYPE_HINT = "C R L D Q U J SW EC XTAL LED OPTO FUSE POT RELAY BZ ANT BAT TP X HW MOD"
 
 # 自动补全类型时，用来向用户说明推断依据的短语。
 _SOURCE_LABEL = {
@@ -3859,6 +3873,31 @@ def run_selftest():
        "没有尺寸的五金件要报缺封装")
     ok(not classify_tags(["HW", "螺丝", "m3", "无封装"]).has("package_missing"),
        "写 无封装 后应通过")
+
+    # --- 模块码 MOD ---
+    # 模块与开发板是成品小板，不是芯片：`U` 说的是裸器件。型号表却会把
+    # `ESP32` / `LM2596` 这类前缀直接推成 U（强度 2，REPL 连问都不问），所以
+    # 这条只做**显式码**——写出来才算数，不挂描述词、不进型号表。与 HW 同族。
+    for tag in ("MOD", "mod", "模块", "模组", "开发板", "module"):
+        eq(canon_type(tag), "MOD", f"{tag} 应归约到 MOD")
+    _mod = classify_tags(["模块", "DHT11", "2.54"])
+    eq(_mod.type_code, "MOD", "模块 是显式类型码")
+    eq(_mod.type_source, "explicit", "MOD 走别名表，来源是显式")
+    eq(_mod.added_type, None, "显式写了类型就不再补标签")
+    eq(_mod.issues, (), "模块 DHT11 2.54 不该报任何问题")
+    # 不写 MOD 时型号表照样把成品板判成芯片——这是已知代价而不是回归：同一个
+    # 型号既可能是裸件也可能是模块，标签本身就分不出来。显式 MOD 必须压过它。
+    eq(tcode(["ESP32-S3"]), "U", "ESP32 前缀仍按型号表推成 U（不写 MOD 时的既有行为）")
+    eq(tcode(["LM2596"]), "U", "LM2596 同理")
+    eq(tcode(["MOD", "ESP32-S3", "2.54"]), "MOD", "显式 MOD 应压过型号表的 U")
+    # 模块通常没有封装，写 无封装 兜底；有排针的写脚距，直接进封装槽。
+    ok(not classify_tags(["MOD", "ESP32-S3", "无封装"]).has("package_missing"),
+       "模块用 无封装 兜底应通过")
+    # VOCAB 多出 mod / module 的代价与 `s` / `ec` 同族。含 mod 的连写标签靠
+    # 残余回退整段退回原 token，子串回退的 ASCII 词边界也不认 `modbus` 里的
+    # mod——两条都钉住，免得日后有人把回退去掉。
+    eq(canon_type("MODBUS"), None, "MODBUS 不得被切成 MOD")
+    eq(canon_type("MOD485"), None, "MOD485 不得被切成 MOD")
 
     # --- 中文描述性词 ---
     eq(tcode(["直插", "5mm", "红"]), "LED", "颜色词应指向 LED")
