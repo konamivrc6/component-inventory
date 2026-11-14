@@ -260,6 +260,12 @@ _PACKAGE_MOUNT_MAP = {
 PACKAGE_NONE = "无封装"
 _PACKAGE_NONE_KEYS = frozenset({"无封装", "不适用", "nopackage", "nopkg"})
 
+# 这两类元件本来就没有封装：模块是成品小板，五金是杂物堆，封装不是它们的身份
+# 属性。不写封装时直接放行，**也不替它补 无封装**：记录保持用户写的样子，代价是
+# `search 无封装` 找不到它们，而且与库里显式写了 无封装 的同款记录相比，这条会被
+# 包含判定看成更宽泛。要出现在检索里就显式写 无封装。
+PACKAGE_OPTIONAL_TYPES = frozenset({"MOD", "HW"})
+
 # 「族名 + 数字」的封装模式。族名必须逐个列举，且后面**必须跟数字**——
 # 否则 `TOMATO` 会被 `TO` 前缀吃掉。
 #
@@ -1410,7 +1416,10 @@ def classify_tags(tags, extra_package=None):
     else:
         issues.append(("type_missing", tuple(tags)))
 
-    if not packages and extra_package is None:
+    # MOD / HW 不要求封装。放行不等于补标签：package 保持 None，记录里也不会
+    # 多出 无封装，检索自然找不到它们（见 PACKAGE_OPTIONAL_TYPES 的代价说明）。
+    if (not packages and extra_package is None
+            and type_code not in PACKAGE_OPTIONAL_TYPES):
         issues.append(("package_missing", tuple(tags)))
 
     added_type = None
@@ -1671,7 +1680,7 @@ def render_issues(plan, tags):
                 f"  标签：{shown}\n"
                 "  补法：加上封装，例如  C 0805 100nF 50V\n"
                 f"  常见封装：{PACKAGE_EXAMPLES}\n"
-                f"  若这个元件确实没有封装（散装、模块、自制件、电池座等），{PACKAGE_NONE_HINT}"
+                f"  若这个元件确实没有封装（散装、自制件、电池座等），{PACKAGE_NONE_HINT}"
             )
     # 块与块之间空一行，而不是紧挨着。每个块只有标题顶格、续行缩进两格，若用一个 \n
     # 拼起来，第二个问题的标题就贴在上一块的缩进续行正下方，读起来像是那行漏了缩进，
@@ -3876,11 +3885,16 @@ def run_selftest():
     eq(tcode(["双通铜柱", "m3", "8mm"]), None, "五金名不参与类型推断")
     ok(classify_tags(["双通铜柱", "m3", "8mm"]).has("type_missing"),
        "没写 HW 时应报缺类型")
-    # 没有尺寸的五金件照样要求封装，用 无封装 兜底（与全库规则一致）。
-    ok(classify_tags(["HW", "螺丝", "m3"]).has("package_missing"),
-       "没有尺寸的五金件要报缺封装")
+    # 五金不要求封装：不写就放行，但**不替它补 无封装**——记录保持用户写的样子，
+    # 所以 search 无封装 找不到它。显式写了仍然是普通封装标签。
+    ok(not classify_tags(["HW", "螺丝", "m3"]).has("package_missing"),
+       "五金件不写封装也应放行")
+    eq(classify_tags(["HW", "螺丝", "m3"]).package, None,
+       "放行不等于补标签：package 仍是 None")
     ok(not classify_tags(["HW", "螺丝", "m3", "无封装"]).has("package_missing"),
-       "写 无封装 后应通过")
+       "写 无封装 后照样通过")
+    eq(classify_tags(["HW", "螺丝", "m3", "无封装"]).package, "无封装",
+       "显式写的 无封装 仍是封装值")
 
     # --- 模块码 MOD ---
     # 模块与开发板是成品小板，不是芯片：`U` 说的是裸器件。型号表却会把
@@ -3898,9 +3912,14 @@ def run_selftest():
     eq(tcode(["ESP32-S3"]), "U", "ESP32 前缀仍按型号表推成 U（不写 MOD 时的既有行为）")
     eq(tcode(["LM2596"]), "U", "LM2596 同理")
     eq(tcode(["MOD", "ESP32-S3", "2.54"]), "MOD", "显式 MOD 应压过型号表的 U")
-    # 模块通常没有封装，写 无封装 兜底；有排针的写脚距，直接进封装槽。
+    # 模块与五金同规则：不写封装放行且不补标签；有排针的写脚距，直接进封装槽。
+    ok(not classify_tags(["MOD", "ESP32-S3"]).has("package_missing"),
+       "模块不写封装也应放行")
+    eq(classify_tags(["MOD", "ESP32-S3"]).package, None, "模块放行不补标签")
+    eq(classify_tags(["MOD", "ESP32-S3", "2.54"]).package, "2.54",
+       "写了脚距仍以它为准")
     ok(not classify_tags(["MOD", "ESP32-S3", "无封装"]).has("package_missing"),
-       "模块用 无封装 兜底应通过")
+       "模块显式写 无封装 应通过")
     # VOCAB 多出 mod / module 的代价与 `s` / `ec` 同族。含 mod 的连写标签靠
     # 残余回退整段退回原 token，子串回退的 ASCII 词边界也不认 `modbus` 里的
     # mod——两条都钉住，免得日后有人把回退去掉。

@@ -46,6 +46,7 @@ from inventory import (
     EXIT_USAGE,
     PACKAGE_EXAMPLES_LINE,
     PACKAGE_NONE_HINT,
+    PACKAGE_OPTIONAL_TYPES,
     PACKAGE_PROMPT,
     PACKAGE_QUESTION,
     STOCK_PROMPT,
@@ -1018,7 +1019,7 @@ _TYPE_PROBLEMS = {"type_conflict", "type_missing", "micro_ambiguous"}
 
 
 def ensure_package(tags):
-    """标签里没有封装就问用户要一个。
+    """标签里没有封装就问用户要一个（MOD / HW 除外）。
 
     返回 (标签列表, extra_package)，取消时返回 (None, None)。
 
@@ -1033,6 +1034,11 @@ def ensure_package(tags):
     if any(k in _TYPE_PROBLEMS for k, _ in plan.issues):
         return tags, None
     if plan.package is not None:
+        return tags, None
+    # MOD / HW 不要求封装，cmd_add 会直接放行。这里再追问就自相矛盾了：
+    # 同一个输入在命令行成功、在 REPL 却被拦住。规则只有一份，在
+    # PACKAGE_OPTIONAL_TYPES。
+    if plan.type_code in PACKAGE_OPTIONAL_TYPES:
         return tags, None
 
     # 问句与示例只打一次，重问时只重出输入点：两行加起来 150 列宽，答错一次就再糊
