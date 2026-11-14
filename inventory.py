@@ -451,10 +451,18 @@ def _package_rank(value):
     return 0 if _pkg_key(value) in _PACKAGE_MOUNT_MAP else 1
 
 
-# REPL 缺封装时弹的询问语。**问句和输入点分成两条**：问句本身就 80 列宽，和输入点挤在
-# 同一行的话，提示符会被推到终端右半边、窄窗口下还要折行；分开以后问句单独占一行，
-# 输入点短且位置固定。措辞集中在这里，交互层只管缩进和取值。
-PACKAGE_QUESTION = "请输入封装（如 0805 / SOT-23 / 5x11 / 2.54 / 直插；确实没有就输入 NO PACKAGE）"
+# 封装示例与「确实没有封装」的写法只写一份：REPL 追问和命令行报错块共用。
+# 曾经两边各列一半——追问那边有 5x11 / 2.54 却没有 DIP / SOIC，报错块反过来——
+# 用户从哪边学会「封装能写什么」，另一边就会漏一块。
+PACKAGE_EXAMPLES = "0402 0603 0805 1206 / SOT-23 SOD-123 / DIP-8 SOIC-14 / 5x11 2.54 / 直插 贴片"
+PACKAGE_NONE_HINT = f"写 {PACKAGE_NONE}（NO PACKAGE 同义）"
+
+# REPL 缺封装时弹的询问语。**问句、示例和输入点分成三条**：问句和输入点挤在
+# 同一行的话，提示符会被推到终端右半边、窄窗口下还要折行；示例这一串本身就有
+# 76 列，塞进问句会超过 130 列。拆开以后输入点短且位置固定。三行都只打一次，
+# 重问时只重出输入点（见 ensure_package）。
+PACKAGE_QUESTION = f"请输入封装；确实没有就{PACKAGE_NONE_HINT}"
+PACKAGE_EXAMPLES_LINE = f"如 {PACKAGE_EXAMPLES}"
 PACKAGE_PROMPT = "封装 > "
 
 # REPL 缺存量时的询问语，同样拆成问句和输入点（这句 99 列宽，更得拆）。
@@ -1662,8 +1670,8 @@ def render_issues(plan, tags):
                 "没有找到封装标签。\n"
                 f"  标签：{shown}\n"
                 "  补法：加上封装，例如  C 0805 100nF 50V\n"
-                "  常见封装：0402 0603 0805 1206 / SOT-23 SOD-123 / DIP-8 SOIC-14 / 直插 贴片\n"
-                f"  若这个元件确实没有封装（散装、模块、自制件、电池座等），写  {PACKAGE_NONE}"
+                f"  常见封装：{PACKAGE_EXAMPLES}\n"
+                f"  若这个元件确实没有封装（散装、模块、自制件、电池座等），{PACKAGE_NONE_HINT}"
             )
     # 块与块之间空一行，而不是紧挨着。每个块只有标题顶格、续行缩进两格，若用一个 \n
     # 拼起来，第二个问题的标题就贴在上一块的缩进续行正下方，读起来像是那行漏了缩进，

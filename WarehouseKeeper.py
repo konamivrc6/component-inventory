@@ -44,6 +44,8 @@ from inventory import (
     EXIT_NOTFOUND,
     EXIT_OK,
     EXIT_USAGE,
+    PACKAGE_EXAMPLES_LINE,
+    PACKAGE_NONE_HINT,
     PACKAGE_PROMPT,
     PACKAGE_QUESTION,
     STOCK_PROMPT,
@@ -1033,9 +1035,11 @@ def ensure_package(tags):
     if plan.package is not None:
         return tags, None
 
-    # 问句只打一次，重问时只重出输入点：那句话 80 列宽，答错一次就再糊一整行更难读，
-    # 而它要说的（封装有哪些写法）不会因为上一次答错而变。重问时旁边那句提示足够提醒。
+    # 问句与示例只打一次，重问时只重出输入点：两行加起来 150 列宽，答错一次就再糊
+    # 一遍更难读，而它们要说的（封装有哪些写法）不会因为上一次答错而变。重问时
+    # 旁边那句提示足够提醒。
     sub_print(PACKAGE_QUESTION)
+    sub_print(PACKAGE_EXAMPLES_LINE)
     while True:
         try:
             ans = sub_ask(PACKAGE_PROMPT).strip()
@@ -1043,7 +1047,7 @@ def ensure_package(tags):
             print("\n已取消。")
             return None, None
         if not ans:
-            sub_print("封装不能为空。确实没有封装的话，输入 NO PACKAGE。")
+            sub_print(f"封装不能为空。确实没有封装的话，{PACKAGE_NONE_HINT}。")
             continue
         # 回答可能是好几个词（`直插 2.54`），不能整句当一条标签塞进库里：
         # 怎么拆、按什么顺序判，全在 resolve_package_answer 里，规则只有一份。
